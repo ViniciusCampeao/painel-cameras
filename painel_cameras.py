@@ -1,0 +1,773 @@
+from flask import Flask, Response, render_template_string, jsonify, request
+from flask_httpauth import HTTPBasicAuth
+from werkzeug.security import generate_password_hash, check_password_hash
+from dotenv import load_dotenv
+import subprocess
+import time
+import threading
+import socket
+import os
+
+load_dotenv()
+
+try:
+    from onvif import ONVIFCamera
+    ONVIF_OK = True
+except Exception:
+    ONVIF_OK = False
+
+app = Flask(__name__)
+auth = HTTPBasicAuth()
+
+USERS = {
+    os.environ["PAINEL_USER"]: generate_password_hash(os.environ["PAINEL_SENHA"])
+}
+
+@auth.verify_password
+def verify(username, password):
+    if username in USERS and check_password_hash(USERS[username], password):
+        return username
+
+
+CAMERAS = {
+    "cozinha": {
+        "nome": "Cozinha",
+        "host": os.environ["CAM_COZINHA_HOST"],
+        "user": os.environ["CAM_COZINHA_USER"],
+        "senha": os.environ["CAM_COZINHA_SENHA"],
+        "path": "/onvif1",
+        "transporte": "tcp",
+        "ptz": True,
+        "audio": False,
+        "onvif_porta": 8899,
+        "inverter_pan": True,
+        "inverter_tilt": False
+    },
+    "garagem": {
+        "nome": "Garagem",
+        "host": os.environ["CAM_GARAGEM_HOST"],
+        "user": os.environ["CAM_GARAGEM_USER"],
+        "senha": os.environ["CAM_GARAGEM_SENHA"],
+        "path": "/onvif1",
+        "audio_path": "/onvif1",
+        "transporte": "auto",
+        "ptz": False,
+        "audio": True,
+        "onvif_porta": 50000,
+        "inverter_pan": False,
+        "inverter_tilt": False
+    },
+    "quarto": {
+        "nome": "Quarto",
+        "host": os.environ["CAM_QUARTO_HOST"],
+        "user": os.environ["CAM_QUARTO_USER"],
+        "senha": os.environ["CAM_QUARTO_SENHA"],
+        "path": "/onvif1",
+        "transporte": "auto",
+        "ptz": False,
+        "audio": True,
+        "onvif_porta": 5000,
+        "inverter_pan": False,
+        "inverter_tilt": False
+    }
+}
+
+PORTAS_ONVIF = [80, 8899, 8000, 2020, 8080, 5000, 8899, 8081, 10080]
+
+
+def rtsp_url(cam):
+    return f"rtsp://{cam['user']}:{cam['senha']}@{cam['host']}:554{cam['path']}"
+
+
+# ---------------------------------------------------------------- PTZ
+
+_ptz_cache = {}
+_ptz_falhas = {}
+_ptz_lock = threading.Lock()
+
+
+def porta_aberta(host, porta, tempo=2.0):
+    s = socket.socket()
+    s.settimeout(tempo)
+    try:
+        s.connect((host, int(porta)))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def get_ptz(cam_id):
+    cam = CAMERAS[cam_id]
+
+    if not cam.get("ptz", True):
+        return None, "PTZ desabilitado para esta camera"
+
+    if not ONVIF_OK:
+        return None, "onvif-zeep nao instalado"
+
+    with _ptz_lock:
+        if cam_id in _ptz_cache:
+            return _ptz_cache[cam_id], None
+        falha = _ptz_falhas.get(cam_id)
+        if falha and time.time() - falha[0] < 60:
+            return None, falha[1]
+
+    portas = [cam["onvif_porta"]] if cam.get("onvif_porta") else PORTAS_ONVIF
+    erro = None
+
+    for porta in portas:
+        if not porta_aberta(cam["host"], porta):
+            erro = f"porta {porta} fechada"
+            continue
+        try:
+            dev = ONVIFCamera(cam["host"], porta, cam["user"], cam["senha"])
+            media = dev.create_media_service()
+            ptz = dev.create_ptz_service()
+            perfil = media.GetProfiles()[0]
+            handle = {"ptz": ptz, "token": perfil.token, "porta": porta}
+            with _ptz_lock:
+                _ptz_cache[cam_id] = handle
+                _ptz_falhas.pop(cam_id, None)
+            print(f"[{cam_id}] ONVIF conectado na porta {porta}")
+            return handle, None
+        except Exception as e:
+            erro = f"porta {porta}: {type(e).__name__}"
+            continue
+
+    erro = erro or "nenhuma porta ONVIF respondeu"
+    with _ptz_lock:
+        _ptz_falhas[cam_id] = (time.time(), erro)
+    return None, erro
+
+
+VELOCIDADES = {
+    "up":        {"pan": 0.0,  "tilt": 0.6,  "zoom": 0.0},
+    "down":      {"pan": 0.0,  "tilt": -0.6, "zoom": 0.0},
+    "left":      {"pan": -0.6, "tilt": 0.0,  "zoom": 0.0},
+    "right":     {"pan": 0.6,  "tilt": 0.0,  "zoom": 0.0},
+    "zoom_in":   {"pan": 0.0,  "tilt": 0.0,  "zoom": 0.5},
+    "zoom_out":  {"pan": 0.0,  "tilt": 0.0,  "zoom": -0.5},
+}
+
+
+def mover(cam_id, direcao, duracao=0.4):
+    handle, erro = get_ptz(cam_id)
+    if not handle:
+        return False, erro
+
+    v = VELOCIDADES.get(direcao)
+    if not v:
+        return False, "direcao invalida"
+
+    cam = CAMERAS[cam_id]
+    pan = -v["pan"] if cam.get("inverter_pan") else v["pan"]
+    tilt = -v["tilt"] if cam.get("inverter_tilt") else v["tilt"]
+
+    ptz = handle["ptz"]
+    token = handle["token"]
+
+    try:
+        req = ptz.create_type("ContinuousMove")
+        req.ProfileToken = token
+        req.Velocity = {
+            "PanTilt": {"x": pan, "y": tilt},
+            "Zoom": {"x": v["zoom"]}
+        }
+        ptz.ContinuousMove(req)
+        time.sleep(min(float(duracao), 2.0))
+        ptz.Stop({"ProfileToken": token})
+        return True, None
+    except Exception as e:
+        with _ptz_lock:
+            _ptz_cache.pop(cam_id, None)
+        return False, str(e)
+
+
+# ------------------------------------------------------------ STREAMS
+
+class StreamManager:
+    def __init__(self):
+        self.locks = {c: threading.Lock() for c in CAMERAS}
+        self.viewers = {c: 0 for c in CAMERAS}
+        self.last_frame = {c: None for c in CAMERAS}
+        self.running = {c: False for c in CAMERAS}
+
+    def _cmd(self, cam):
+        cmd = ["ffmpeg"]
+        t = cam.get("transporte", "tcp")
+        if t in ("tcp", "udp"):
+            cmd += ["-rtsp_transport", t]
+        cmd += [
+            "-i", rtsp_url(cam),
+            "-an",
+            "-vf", "scale=640:-1",
+            "-r", "8",
+            "-q:v", "8",
+            "-f", "image2pipe",
+            "-vcodec", "mjpeg",
+            "-"
+        ]
+        return cmd
+
+    def _loop(self, cam_id):
+        cam = CAMERAS[cam_id]
+        while self.running[cam_id]:
+            print(f"[{cam_id}] FFmpeg iniciando (viewers: {self.viewers[cam_id]})")
+            proc = None
+            try:
+                proc = subprocess.Popen(self._cmd(cam), stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, bufsize=0)
+                buf = b""
+                while self.running[cam_id] and self.viewers[cam_id] > 0:
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while True:
+                        i = buf.find(b"\xff\xd8")
+                        f = buf.find(b"\xff\xd9")
+                        if i != -1 and f != -1 and f > i:
+                            self.last_frame[cam_id] = buf[i:f + 2]
+                            buf = buf[f + 2:]
+                        else:
+                            break
+            except Exception as e:
+                print(f"[{cam_id}] Erro: {e}")
+            finally:
+                try:
+                    if proc:
+                        proc.kill()
+                        proc.wait()
+                except Exception:
+                    pass
+
+            if self.running[cam_id] and self.viewers[cam_id] > 0:
+                time.sleep(3)
+            else:
+                break
+
+        self.running[cam_id] = False
+        self.last_frame[cam_id] = None
+        print(f"[{cam_id}] FFmpeg parado")
+
+    def add(self, cam_id):
+        with self.locks[cam_id]:
+            self.viewers[cam_id] += 1
+            if not self.running[cam_id]:
+                self.running[cam_id] = True
+                threading.Thread(target=self._loop, args=(cam_id,), daemon=True).start()
+
+    def remove(self, cam_id):
+        with self.locks[cam_id]:
+            self.viewers[cam_id] = max(0, self.viewers[cam_id] - 1)
+            if self.viewers[cam_id] == 0:
+                self.running[cam_id] = False
+
+    def generate(self, cam_id):
+        self.add(cam_id)
+        try:
+            ultimo = None
+            while self.running[cam_id] or self.viewers[cam_id] > 0:
+                frame = self.last_frame[cam_id]
+                if frame and frame is not ultimo:
+                    ultimo = frame
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                           b"Cache-Control: no-cache\r\n\r\n" + frame + b"\r\n")
+                else:
+                    time.sleep(0.05)
+        except GeneratorExit:
+            pass
+        finally:
+            self.remove(cam_id)
+
+
+streams = StreamManager()
+
+
+def gerar_audio(cam_id):
+    cam = CAMERAS[cam_id]
+    cmd = ["ffmpeg", "-fflags", "nobuffer"]
+    t = cam.get("transporte", "tcp")
+    if t in ("tcp", "udp"):
+        cmd += ["-rtsp_transport", t]
+    audio_url = rtsp_url(cam)
+    if cam.get("audio_path"):
+        audio_url = audio_url.replace(cam["path"], cam["audio_path"])
+    cmd += [
+        "-i", audio_url,
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", "32k",
+        "-ac", "1",
+        "-ar", "16000",
+        "-flush_packets", "1",
+        "-f", "mp3",
+        "-"
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, bufsize=0)
+    print(f"[{cam_id}] audio iniciado")
+    try:
+        while True:
+            chunk = proc.stdout.read(2048)
+            if not chunk:
+                break
+            yield chunk
+    except GeneratorExit:
+        pass
+    finally:
+        try:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+        print(f"[{cam_id}] audio parado")
+
+
+HTML = """
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>Cameras</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0b0d10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Cameras">
+<link rel="apple-touch-icon" href="/icon-192.svg">
+<style>
+:root {
+  --bg: #0b0d10;
+  --card: #14181d;
+  --card-2: #1b2027;
+  --line: #232a33;
+  --txt: #e6e9ed;
+  --dim: #8b95a1;
+  --ok: #35d07f;
+  --off: #f2545b;
+}
+* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+body {
+  background: var(--bg); color: var(--txt);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  min-height: 100dvh;
+  padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+}
+header {
+  display:flex; align-items:center; justify-content:space-between;
+  padding: 16px 18px 12px;
+}
+header h1 { font-size:19px; font-weight:650; letter-spacing:-0.2px; }
+header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
+.restart-btn {
+  width:38px; height:38px; border-radius:11px; border:1px solid var(--line);
+  background:var(--card); color:var(--txt); font-size:18px; cursor:pointer;
+  display:flex; align-items:center; justify-content:center; line-height:1;
+}
+.restart-btn:active { background:var(--card-2); transform:scale(0.94); }
+.restart-btn.loading { animation: girar 0.8s linear infinite; pointer-events:none; opacity:0.6; }
+@keyframes girar { from { transform:rotate(0deg); } to { transform:rotate(360deg); } }
+
+.wrap { display:flex; flex-direction:column; gap:18px; padding: 4px 14px 28px; }
+@media (min-width:900px) {
+  .wrap { display:grid; grid-template-columns:1fr 1fr; gap:20px; padding:4px 20px 32px; }
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  overflow: hidden;
+}
+.card-top {
+  display:flex; align-items:center; justify-content:space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.card-top .nome { font-size:14px; font-weight:600; letter-spacing:0.2px; }
+.dot { width:8px; height:8px; border-radius:50%; background:var(--ok); box-shadow:0 0 8px var(--ok); }
+.dot.off { background:var(--off); box-shadow:0 0 8px var(--off); }
+
+.feed { position:relative; background:#000; line-height:0; }
+.feed img { width:100%; display:block; min-height:190px; object-fit:contain; background:#000; }
+.expand {
+  position:absolute; bottom:10px; right:10px;
+  width:34px; height:34px; border-radius:10px; border:none;
+  background:rgba(10,12,15,0.75); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+  color:#fff; font-size:15px; cursor:pointer; line-height:1;
+}
+
+.som {
+  position:absolute; bottom:10px; right:52px;
+  width:34px; height:34px; border-radius:10px; border:none;
+  background:rgba(10,12,15,0.75); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+  color:#fff; font-size:15px; cursor:pointer; line-height:1;
+}
+.som.on { background:rgba(53,208,127,0.85); }
+
+.ptz { padding: 14px; display:flex; align-items:center; justify-content:center; gap:22px; }
+.dpad { display:grid; grid-template-columns:repeat(3,42px); grid-template-rows:repeat(3,42px); gap:6px; }
+.dpad button, .zbtn {
+  background: var(--card-2); border:1px solid var(--line); color:var(--txt);
+  border-radius:11px; font-size:16px; cursor:pointer; display:flex;
+  align-items:center; justify-content:center; font-family:inherit; user-select:none;
+}
+.dpad button:active, .zbtn:active { background:#2b3440; transform:scale(0.94); }
+.dpad .center { background:transparent; border:none; cursor:default; }
+.zoom { display:flex; flex-direction:column; gap:6px; }
+.zbtn { width:42px; height:42px; font-size:19px; font-weight:500; }
+
+.toast {
+  position:fixed; left:50%; bottom:24px; transform:translateX(-50%) translateY(80px);
+  background:#232a33; border:1px solid var(--line); color:var(--txt);
+  padding:10px 16px; border-radius:11px; font-size:13px;
+  opacity:0; transition:all .22s ease; pointer-events:none; z-index:200; max-width:88vw;
+}
+.toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+
+.fs { position:fixed; inset:0; z-index:150; background:#000; display:none; }
+.fs.on { display:flex; align-items:center; justify-content:center; }
+.fs img { width:100%; height:100%; object-fit:contain; }
+.fs-close {
+  position:fixed; top:calc(16px + env(safe-area-inset-top)); right:16px; z-index:151;
+  width:38px; height:38px; border-radius:50%; border:none;
+  background:rgba(10,12,15,0.8); backdrop-filter:blur(10px); color:#fff; font-size:17px; cursor:pointer;
+}
+.fs-ptz {
+  position:fixed; bottom:calc(22px + env(safe-area-inset-bottom)); left:50%; transform:translateX(-50%);
+  z-index:151; display:flex; gap:20px; align-items:center;
+  background:rgba(10,12,15,0.7); backdrop-filter:blur(12px);
+  padding:12px 18px; border-radius:18px; border:1px solid rgba(255,255,255,0.08);
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Cameras</h1>
+    <div class="sub" id="sub">{{ cameras|length }} dispositivos</div>
+  </div>
+  <button class="restart-btn" id="restartBtn" onclick="confirmarRestart()" title="Reiniciar servico">&#8635;</button>
+</header>
+
+<div class="wrap">
+  {% for cid, cam in cameras.items() %}
+  <section class="card" data-cam="{{ cid }}">
+    <div class="card-top">
+      <span class="nome">{{ cam.nome }}</span>
+      <span class="dot"></span>
+    </div>
+
+    <div class="feed">
+      <img src="/video/{{ cid }}" alt="{{ cam.nome }}"
+           onerror="marcar('{{ cid }}', false)"
+           onload="marcar('{{ cid }}', true)">
+      {% if cam.audio %}
+      <button class="som" id="som-{{ cid }}" onclick="toggleSom('{{ cid }}')">&#128263;</button>
+      {% endif %}
+      <button class="expand" onclick="abrirFs('{{ cid }}', {{ 'true' if cam.ptz else 'false' }})">&#9974;</button>
+    </div>
+
+    {% if cam.ptz %}
+    <div class="ptz">
+      <div class="dpad">
+        <span></span>
+        <button onclick="ptz('{{ cid }}','up')">&#9650;</button>
+        <span></span>
+        <button onclick="ptz('{{ cid }}','left')">&#9664;</button>
+        <span class="center"></span>
+        <button onclick="ptz('{{ cid }}','right')">&#9654;</button>
+        <span></span>
+        <button onclick="ptz('{{ cid }}','down')">&#9660;</button>
+        <span></span>
+      </div>
+      <div class="zoom">
+        <button class="zbtn" onclick="ptz('{{ cid }}','zoom_in')">+</button>
+        <button class="zbtn" onclick="ptz('{{ cid }}','zoom_out')">&#8722;</button>
+      </div>
+    </div>
+    {% endif %}
+  </section>
+  {% endfor %}
+</div>
+
+<div class="fs" id="fs"><img id="fsImg" alt=""></div>
+<button class="fs-close" id="fsClose" onclick="fecharFs()" style="display:none">&#10005;</button>
+<div class="fs-ptz" id="fsPtz" style="display:none">
+  <div class="dpad">
+    <span></span><button data-d="up">&#9650;</button><span></span>
+    <button data-d="left">&#9664;</button><span class="center"></span><button data-d="right">&#9654;</button>
+    <span></span><button data-d="down">&#9660;</button><span></span>
+  </div>
+  <div class="zoom">
+    <button class="zbtn" data-d="zoom_in">+</button>
+    <button class="zbtn" data-d="zoom_out">&#8722;</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let camAtual = null;
+
+function marcar(cid, ok) {
+  const card = document.querySelector('[data-cam="' + cid + '"]');
+  if (!card) return;
+  card.querySelector('.dot').classList.toggle('off', !ok);
+}
+
+function aviso(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+async function ptz(cid, dir) {
+  try {
+    const r = await fetch('/ptz/' + cid, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dir: dir})
+    });
+    const j = await r.json();
+    if (!j.ok) aviso('PTZ: ' + (j.erro || 'falhou'));
+  } catch (e) {
+    aviso('PTZ: sem resposta');
+  }
+}
+
+const sons = {};
+
+function toggleSom(cid) {
+  const btn = document.getElementById('som-' + cid);
+  if (sons[cid]) {
+    sons[cid].pause();
+    sons[cid].src = '';
+    delete sons[cid];
+    btn.innerHTML = '&#128263;';
+    btn.classList.remove('on');
+    return;
+  }
+  const a = new Audio('/audio/' + cid + '?t=' + Date.now());
+  a.onerror = () => { aviso('Audio indisponivel'); delete sons[cid]; btn.innerHTML = '&#128263;'; btn.classList.remove('on'); };
+  a.play().then(() => {
+    sons[cid] = a;
+    btn.innerHTML = '&#128266;';
+    btn.classList.add('on');
+  }).catch(() => aviso('Toque de novo para liberar o audio'));
+}
+
+function abrirFs(cid, temPtz) {
+  camAtual = cid;
+  document.getElementById('fsImg').src = '/video/' + cid + '?fs=1&t=' + Date.now();
+  document.getElementById('fs').classList.add('on');
+  document.getElementById('fsClose').style.display = 'block';
+  document.getElementById('fsPtz').style.display = temPtz ? 'flex' : 'none';
+}
+
+function fecharFs() {
+  document.getElementById('fsImg').src = '';
+  document.getElementById('fs').classList.remove('on');
+  document.getElementById('fsClose').style.display = 'none';
+  document.getElementById('fsPtz').style.display = 'none';
+  camAtual = null;
+}
+
+document.querySelectorAll('#fsPtz [data-d]').forEach(b => {
+  b.onclick = () => { if (camAtual) ptz(camAtual, b.dataset.d); };
+});
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') fecharFs(); });
+
+setInterval(() => {
+  document.querySelectorAll('.dot.off').forEach(dot => {
+    const img = dot.closest('.card').querySelector('.feed img');
+    img.src = img.src.split('?')[0] + '?t=' + Date.now();
+  });
+}, 8000);
+
+window.addEventListener('pagehide', () => {
+  Object.values(sons).forEach(a => { a.pause(); a.src = ''; });
+});
+
+function confirmarRestart() {
+  if (!confirm('Reiniciar o servico das cameras? As transmissoes ficam fora do ar por alguns segundos.')) return;
+  reiniciar();
+}
+
+async function reiniciar() {
+  const btn = document.getElementById('restartBtn');
+  btn.classList.add('loading');
+  try {
+    const r = await fetch('/restart', { method: 'POST' });
+    const j = await r.json();
+    if (j.ok) {
+      aviso('Reiniciando... a pagina vai recarregar sozinha');
+      aguardarVoltar();
+    } else {
+      aviso('Falha ao reiniciar: ' + (j.erro || 'erro desconhecido'));
+      btn.classList.remove('loading');
+    }
+  } catch (e) {
+    aviso('Falha ao reiniciar: sem resposta');
+    btn.classList.remove('loading');
+  }
+}
+
+function aguardarVoltar() {
+  let tentativas = 0;
+  const iv = setInterval(async () => {
+    tentativas++;
+    try {
+      const r = await fetch('/status', { cache: 'no-store' });
+      if (r.ok) {
+        clearInterval(iv);
+        location.reload();
+        return;
+      }
+    } catch (e) {}
+    if (tentativas > 40) clearInterval(iv);
+  }, 1500);
+}
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+</script>
+</body>
+</html>
+"""
+
+MANIFEST = {
+    "name": "Cameras", "short_name": "Cameras", "start_url": "/",
+    "display": "standalone", "background_color": "#0b0d10",
+    "theme_color": "#0b0d10", "orientation": "any",
+    "icons": [
+        {"src": "/icon-192.svg", "sizes": "192x192", "type": "image/svg+xml"},
+        {"src": "/icon-512.svg", "sizes": "512x512", "type": "image/svg+xml"}
+    ]
+}
+
+SW_JS = "self.addEventListener('fetch', e => e.respondWith(fetch(e.request)));"
+
+ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">'
+            '<rect width="192" height="192" rx="42" fill="#0b0d10"/>'
+            '<circle cx="96" cy="86" r="34" fill="none" stroke="#35d07f" stroke-width="7"/>'
+            '<circle cx="96" cy="86" r="11" fill="#35d07f"/>'
+            '<rect x="58" y="134" width="76" height="8" rx="4" fill="#2b3440"/></svg>')
+
+
+@app.route("/")
+@auth.login_required
+def index():
+    return render_template_string(HTML, cameras=CAMERAS)
+
+
+@app.route("/manifest.json")
+def manifest():
+    return jsonify(MANIFEST)
+
+
+@app.route("/sw.js")
+def sw():
+    return Response(SW_JS, mimetype="application/javascript")
+
+
+@app.route("/icon-192.svg")
+@app.route("/icon-512.svg")
+def icone():
+    return Response(ICON_SVG, mimetype="image/svg+xml")
+
+
+@app.route("/video/<cam_id>")
+@auth.login_required
+def video(cam_id):
+    if cam_id not in CAMERAS:
+        return "Camera nao encontrada", 404
+    return Response(streams.generate(cam_id),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/audio/<cam_id>")
+@auth.login_required
+def audio(cam_id):
+    if cam_id not in CAMERAS:
+        return "Camera nao encontrada", 404
+    if not CAMERAS[cam_id].get("audio"):
+        return "Camera sem audio", 404
+    return Response(gerar_audio(cam_id), mimetype="audio/mpeg")
+
+
+@app.route("/ptz/<cam_id>", methods=["POST"])
+@auth.login_required
+def ptz_route(cam_id):
+    if cam_id not in CAMERAS:
+        return jsonify({"ok": False, "erro": "camera invalida"}), 404
+    dados = request.get_json(silent=True) or {}
+    direcao = dados.get("dir", "")
+    dur = dados.get("dur", 0.4)
+    ok, erro = mover(cam_id, direcao, dur)
+    return jsonify({"ok": ok, "erro": erro})
+
+
+@app.route("/ptz-debug/<cam_id>")
+@auth.login_required
+def ptz_debug(cam_id):
+    if cam_id not in CAMERAS:
+        return jsonify({"erro": "camera invalida"}), 404
+    handle, erro = get_ptz(cam_id)
+    if not handle:
+        return jsonify({"onvif_lib": ONVIF_OK, "conectado": False, "erro": erro})
+    return jsonify({"onvif_lib": ONVIF_OK, "conectado": True,
+                    "porta": handle["porta"], "token": str(handle["token"])})
+
+
+@app.route("/snapshot/<cam_id>")
+@auth.login_required
+def snapshot(cam_id):
+    if cam_id not in CAMERAS:
+        return "Camera nao encontrada", 404
+    cam = CAMERAS[cam_id]
+    cmd = ["ffmpeg"]
+    t = cam.get("transporte", "tcp")
+    if t in ("tcp", "udp"):
+        cmd += ["-rtsp_transport", t]
+    cmd += ["-i", rtsp_url(cam), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
+    try:
+        img = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=12)
+        return Response(img, mimetype="image/jpeg")
+    except Exception:
+        return "Erro ao capturar snapshot", 500
+
+
+@app.route("/restart", methods=["POST"])
+@auth.login_required
+def restart():
+    try:
+        subprocess.Popen(
+            ["bash", "-c", "sleep 1 && sudo -n systemctl restart --no-block painel-cameras.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "erro": str(e)}), 500
+
+
+@app.route("/status")
+@auth.login_required
+def status():
+    return jsonify({c: {"viewers": streams.viewers[c], "running": streams.running[c]}
+                    for c in CAMERAS})
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5055, debug=False, threaded=True)
