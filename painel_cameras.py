@@ -7,6 +7,7 @@ import time
 import threading
 import socket
 import os
+from urllib.parse import quote
 
 load_dotenv()
 
@@ -50,23 +51,10 @@ CAMERAS = {
         "senha": os.environ["CAM_GARAGEM_SENHA"],
         "path": "/onvif2",
         "audio_path": "/onvif1",
-        "transporte": "auto",
+        "transporte": "udp",
         "ptz": False,
         "audio": True,
         "onvif_porta": 50000,
-        "inverter_pan": False,
-        "inverter_tilt": False
-    },
-    "quarto": {
-        "nome": "Quarto",
-        "host": os.environ["CAM_QUARTO_HOST"],
-        "user": os.environ["CAM_QUARTO_USER"],
-        "senha": os.environ["CAM_QUARTO_SENHA"],
-        "path": "/onvif2",
-        "transporte": "auto",
-        "ptz": False,
-        "audio": True,
-        "onvif_porta": 5000,
         "inverter_pan": False,
         "inverter_tilt": False
     }
@@ -76,7 +64,9 @@ PORTAS_ONVIF = [80, 8899, 8000, 2020, 8080, 5000, 8899, 8081, 10080]
 
 
 def rtsp_url(cam):
-    return f"rtsp://{cam['user']}:{cam['senha']}@{cam['host']}:554{cam['path']}"
+    user = quote(cam['user'], safe='')
+    senha = quote(cam['senha'], safe='')
+    return f"rtsp://{user}:{senha}@{cam['host']}:554{cam['path']}"
 
 
 # ---------------------------------------------------------------- PTZ
@@ -196,6 +186,25 @@ class StreamManager:
         self.viewers = {c: 0 for c in CAMERAS}
         self.last_frame = {c: None for c in CAMERAS}
         self.running = {c: False for c in CAMERAS}
+        self.last_poll = {c: 0.0 for c in CAMERAS}
+        threading.Thread(target=self._poll_watchdog, daemon=True).start()
+
+    def touch(self, cam_id):
+        self.last_poll[cam_id] = time.time()
+        with self.locks[cam_id]:
+            if not self.running[cam_id]:
+                self.running[cam_id] = True
+                self.viewers[cam_id] = 1
+                threading.Thread(target=self._loop, args=(cam_id,), daemon=True).start()
+
+    def _poll_watchdog(self):
+        while True:
+            time.sleep(5)
+            for cam_id in CAMERAS:
+                if self.running[cam_id] and self.last_poll[cam_id] and time.time() - self.last_poll[cam_id] > 15:
+                    with self.locks[cam_id]:
+                        self.running[cam_id] = False
+                        self.viewers[cam_id] = 0
 
     def _cmd(self, cam):
         cmd = ["ffmpeg"]
@@ -468,9 +477,7 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
     </div>
 
     <div class="feed">
-      <img src="/video/{{ cid }}" alt="{{ cam.nome }}"
-           onerror="marcar('{{ cid }}', false)"
-           onload="marcar('{{ cid }}', true)">
+      <img src="/frame/{{ cid }}" alt="{{ cam.nome }}" data-cam-feed="{{ cid }}">
       {% if cam.audio %}
       <button class="som" id="som-{{ cid }}" onclick="toggleSom('{{ cid }}')">&#128263;</button>
       {% endif %}
@@ -570,7 +577,6 @@ function toggleSom(cid) {
 
 function abrirFs(cid, temPtz) {
   camAtual = cid;
-  document.getElementById('fsImg').src = '/video/' + cid + '?fs=1&t=' + Date.now();
   document.getElementById('fs').classList.add('on');
   document.getElementById('fsClose').style.display = 'block';
   document.getElementById('fsPtz').style.display = temPtz ? 'flex' : 'none';
@@ -590,12 +596,31 @@ document.querySelectorAll('#fsPtz [data-d]').forEach(b => {
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') fecharFs(); });
 
-setInterval(() => {
-  document.querySelectorAll('.dot.off').forEach(dot => {
-    const img = dot.closest('.card').querySelector('.feed img');
-    img.src = img.src.split('?')[0] + '?t=' + Date.now();
+document.querySelectorAll('[data-cam-feed]').forEach(img => {
+  const cid = img.dataset.camFeed;
+  let active = true;
+  function poll() {
+    if (!active) return;
+    const next = new Image();
+    next.onload = () => {
+      img.src = next.src;
+      const fsImg = document.getElementById('fsImg');
+      if (camAtual === cid) fsImg.src = next.src;
+      marcar(cid, true);
+      setTimeout(poll, 150);
+    };
+    next.onerror = () => {
+      marcar(cid, false);
+      setTimeout(poll, 2000);
+    };
+    next.src = '/frame/' + cid + '?t=' + Date.now();
+  }
+  poll();
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { active = false; }
+    else { active = true; poll(); }
   });
-}, 8000);
+});
 
 window.addEventListener('pagehide', () => {
   Object.values(sons).forEach(a => { a.pause(); a.src = ''; });
@@ -695,6 +720,19 @@ def video(cam_id):
         return "Camera nao encontrada", 404
     return Response(streams.generate(cam_id),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/frame/<cam_id>")
+@auth.login_required
+def frame(cam_id):
+    if cam_id not in CAMERAS:
+        return "Camera nao encontrada", 404
+    streams.touch(cam_id)
+    f = streams.last_frame[cam_id]
+    if f is None:
+        return "", 204
+    return Response(f, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
 
 
 @app.route("/audio/<cam_id>")
