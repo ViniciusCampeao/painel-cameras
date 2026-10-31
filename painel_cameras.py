@@ -7,6 +7,10 @@ import time
 import threading
 import socket
 import os
+from urllib.parse import quote
+import cv2
+import numpy as np
+from io import BytesIO
 
 load_dotenv()
 
@@ -15,6 +19,13 @@ try:
     ONVIF_OK = True
 except Exception:
     ONVIF_OK = False
+
+try:
+    from detector_lite import Detector
+    DETECTOR_OK = True
+except Exception as e:
+    print(f"[init] Detector não disponível: {e}")
+    DETECTOR_OK = False
 
 app = Flask(__name__)
 auth = HTTPBasicAuth()
@@ -50,23 +61,10 @@ CAMERAS = {
         "senha": os.environ["CAM_GARAGEM_SENHA"],
         "path": "/onvif2",
         "audio_path": "/onvif1",
-        "transporte": "auto",
+        "transporte": "udp",
         "ptz": False,
         "audio": True,
         "onvif_porta": 50000,
-        "inverter_pan": False,
-        "inverter_tilt": False
-    },
-    "quarto": {
-        "nome": "Quarto",
-        "host": os.environ["CAM_QUARTO_HOST"],
-        "user": os.environ["CAM_QUARTO_USER"],
-        "senha": os.environ["CAM_QUARTO_SENHA"],
-        "path": "/onvif2",
-        "transporte": "auto",
-        "ptz": False,
-        "audio": True,
-        "onvif_porta": 5000,
         "inverter_pan": False,
         "inverter_tilt": False
     }
@@ -76,7 +74,9 @@ PORTAS_ONVIF = [80, 8899, 8000, 2020, 8080, 5000, 8899, 8081, 10080]
 
 
 def rtsp_url(cam):
-    return f"rtsp://{cam['user']}:{cam['senha']}@{cam['host']}:554{cam['path']}"
+    user = quote(cam['user'], safe='')
+    senha = quote(cam['senha'], safe='')
+    return f"rtsp://{user}:{senha}@{cam['host']}:554{cam['path']}"
 
 
 # ---------------------------------------------------------------- PTZ
@@ -196,6 +196,25 @@ class StreamManager:
         self.viewers = {c: 0 for c in CAMERAS}
         self.last_frame = {c: None for c in CAMERAS}
         self.running = {c: False for c in CAMERAS}
+        self.last_poll = {c: 0.0 for c in CAMERAS}
+        threading.Thread(target=self._poll_watchdog, daemon=True).start()
+
+    def touch(self, cam_id):
+        self.last_poll[cam_id] = time.time()
+        with self.locks[cam_id]:
+            if not self.running[cam_id]:
+                self.running[cam_id] = True
+                self.viewers[cam_id] = 1
+                threading.Thread(target=self._loop, args=(cam_id,), daemon=True).start()
+
+    def _poll_watchdog(self):
+        while True:
+            time.sleep(5)
+            for cam_id in CAMERAS:
+                if self.running[cam_id] and self.last_poll[cam_id] and time.time() - self.last_poll[cam_id] > 15:
+                    with self.locks[cam_id]:
+                        self.running[cam_id] = False
+                        self.viewers[cam_id] = 0
 
     def _cmd(self, cam):
         cmd = ["ffmpeg"]
@@ -288,6 +307,19 @@ class StreamManager:
 
 
 streams = StreamManager()
+
+detector_instance = None
+detector_lock = threading.Lock()
+
+def get_detector():
+    global detector_instance
+    if not DETECTOR_OK:
+        return None
+    with detector_lock:
+        if detector_instance is None:
+            print("[detector] inicializando Detector...")
+            detector_instance = Detector()
+        return detector_instance
 
 
 def gerar_audio(cam_id):
@@ -413,6 +445,14 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
 }
 .som.on { background:rgba(53,208,127,0.85); }
 
+.detect {
+  position:absolute; bottom:10px; right:94px;
+  width:34px; height:34px; border-radius:10px; border:none;
+  background:rgba(10,12,15,0.75); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+  color:#fff; font-size:15px; cursor:pointer; line-height:1;
+}
+.detect.on { background:rgba(255,100,0,0.85); }
+
 .ptz { padding: 14px; display:flex; align-items:center; justify-content:center; gap:22px; }
 .dpad { display:grid; grid-template-columns:repeat(3,42px); grid-template-rows:repeat(3,42px); gap:6px; }
 .dpad button, .zbtn {
@@ -468,12 +508,11 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
     </div>
 
     <div class="feed">
-      <img src="/video/{{ cid }}" alt="{{ cam.nome }}"
-           onerror="marcar('{{ cid }}', false)"
-           onload="marcar('{{ cid }}', true)">
+      <img src="/frame/{{ cid }}" alt="{{ cam.nome }}" data-cam-feed="{{ cid }}" data-normal-url="/frame/{{ cid }}" data-detect-url="/frame/{{ cid }}/detect">
       {% if cam.audio %}
       <button class="som" id="som-{{ cid }}" onclick="toggleSom('{{ cid }}')">&#128263;</button>
       {% endif %}
+      <button class="detect" id="detect-{{ cid }}" onclick="toggleDetect('{{ cid }}')" title="YOLO + Face Detection">🔍</button>
       <button class="expand" onclick="abrirFs('{{ cid }}', {{ 'true' if cam.ptz else 'false' }})">&#9974;</button>
     </div>
 
@@ -568,9 +607,28 @@ function toggleSom(cid) {
   }).catch(() => aviso('Toque de novo para liberar o audio'));
 }
 
+const detectStatus = {};
+
+function toggleDetect(cid) {
+  const btn = document.getElementById('detect-' + cid);
+  const img = document.querySelector('[data-cam-feed="' + cid + '"]');
+  if (!img) return;
+
+  if (detectStatus[cid]) {
+    img.dataset.useDetect = 'false';
+    detectStatus[cid] = false;
+    btn.classList.remove('on');
+    aviso('Detecção desativada');
+  } else {
+    img.dataset.useDetect = 'true';
+    detectStatus[cid] = true;
+    btn.classList.add('on');
+    aviso('Detecção ativada (YOLO + Face)');
+  }
+}
+
 function abrirFs(cid, temPtz) {
   camAtual = cid;
-  document.getElementById('fsImg').src = '/video/' + cid + '?fs=1&t=' + Date.now();
   document.getElementById('fs').classList.add('on');
   document.getElementById('fsClose').style.display = 'block';
   document.getElementById('fsPtz').style.display = temPtz ? 'flex' : 'none';
@@ -590,12 +648,34 @@ document.querySelectorAll('#fsPtz [data-d]').forEach(b => {
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') fecharFs(); });
 
-setInterval(() => {
-  document.querySelectorAll('.dot.off').forEach(dot => {
-    const img = dot.closest('.card').querySelector('.feed img');
-    img.src = img.src.split('?')[0] + '?t=' + Date.now();
+document.querySelectorAll('[data-cam-feed]').forEach(img => {
+  const cid = img.dataset.camFeed;
+  let active = true;
+  img.dataset.useDetect = 'false';
+  function poll() {
+    if (!active) return;
+    const next = new Image();
+    next.onload = () => {
+      img.src = next.src;
+      const fsImg = document.getElementById('fsImg');
+      if (camAtual === cid) fsImg.src = next.src;
+      marcar(cid, true);
+      setTimeout(poll, 150);
+    };
+    next.onerror = () => {
+      marcar(cid, false);
+      setTimeout(poll, 2000);
+    };
+    const useDetect = detectStatus[cid] ? 'detect' : '';
+    const baseUrl = useDetect ? img.dataset.detectUrl : img.dataset.normalUrl;
+    next.src = baseUrl + '?t=' + Date.now();
+  }
+  poll();
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { active = false; }
+    else { active = true; poll(); }
   });
-}, 8000);
+});
 
 window.addEventListener('pagehide', () => {
   Object.values(sons).forEach(a => { a.pause(); a.src = ''; });
@@ -695,6 +775,51 @@ def video(cam_id):
         return "Camera nao encontrada", 404
     return Response(streams.generate(cam_id),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/frame/<cam_id>")
+@auth.login_required
+def frame(cam_id):
+    if cam_id not in CAMERAS:
+        return "Camera nao encontrada", 404
+    streams.touch(cam_id)
+    f = streams.last_frame[cam_id]
+    if f is None:
+        return "", 204
+    return Response(f, mimetype="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.route("/frame/<cam_id>/detect")
+@auth.login_required
+def frame_detect(cam_id):
+    if cam_id not in CAMERAS:
+        return "Camera nao encontrada", 404
+
+    detector = get_detector()
+    if not detector:
+        return "Detector nao disponivel", 501
+
+    streams.touch(cam_id)
+    jpeg_data = streams.last_frame[cam_id]
+    if jpeg_data is None:
+        return "", 204
+
+    try:
+        frame_bgr = cv2.imdecode(np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            return "", 204
+
+        annotated = detector.process(frame_bgr)
+
+        _, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        jpeg_out = buffer.tobytes()
+
+        return Response(jpeg_out, mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+    except Exception as e:
+        print(f"[frame_detect] erro: {e}")
+        return "", 500
 
 
 @app.route("/audio/<cam_id>")
