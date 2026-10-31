@@ -12,11 +12,15 @@ except ImportError:
 try:
     import face_recognition
     try:
-        face_recognition.load_image_file  # test if models are installed
+        # Tenta importar - ignora avisos de modelos
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            face_recognition.load_image_file  # test if callable
         FACE_OK = True
-    except (AttributeError, Exception):
+    except Exception:
         FACE_OK = False
-except (ImportError, ModuleNotFoundError):
+except (ImportError, ModuleNotFoundError, Exception):
     FACE_OK = False
 
 
@@ -29,32 +33,35 @@ class FaceManager:
 
     def _load_known(self, known_faces_dir):
         if not FACE_OK:
-            print("[faces] face_recognition não instalado")
             return
 
-        base_dir = Path(known_faces_dir)
-        base_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            base_dir = Path(known_faces_dir)
+            base_dir.mkdir(parents=True, exist_ok=True)
 
-        self._encodings.clear()
-        self._names.clear()
+            self._encodings.clear()
+            self._names.clear()
 
-        for person_dir in sorted(base_dir.iterdir()):
-            if not person_dir.is_dir():
-                continue
-            name = person_dir.name
-            for img_path in person_dir.glob("*"):
-                if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+            for person_dir in sorted(base_dir.iterdir()):
+                if not person_dir.is_dir():
                     continue
-                try:
-                    img = face_recognition.load_image_file(str(img_path))
-                    encs = face_recognition.face_encodings(img)
-                    for enc in encs:
-                        self._encodings.append(enc)
-                        self._names.append(name)
-                except Exception as e:
-                    print(f"[faces] erro ao carregar {img_path}: {e}")
+                name = person_dir.name
+                for img_path in person_dir.glob("*"):
+                    if img_path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+                        continue
+                    try:
+                        img = face_recognition.load_image_file(str(img_path))
+                        encs = face_recognition.face_encodings(img)
+                        for enc in encs:
+                            self._encodings.append(enc)
+                            self._names.append(name)
+                    except Exception:
+                        pass
 
-        print(f"[faces] carregado {len(self._encodings)} encodings para {len(set(self._names))} pessoas")
+            if len(self._encodings) > 0:
+                print(f"[faces] carregado {len(self._encodings)} encodings para {len(set(self._names))} pessoas")
+        except Exception:
+            pass
 
     def identify(self, frame_rgb, locations=None):
         if not FACE_OK:
