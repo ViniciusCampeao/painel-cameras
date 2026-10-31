@@ -11,8 +11,12 @@ except ImportError:
 
 try:
     import face_recognition
-    FACE_OK = True
-except ImportError:
+    try:
+        face_recognition.load_image_file  # test if models are installed
+        FACE_OK = True
+    except (AttributeError, Exception):
+        FACE_OK = False
+except (ImportError, ModuleNotFoundError):
     FACE_OK = False
 
 
@@ -53,7 +57,7 @@ class FaceManager:
         print(f"[faces] carregado {len(self._encodings)} encodings para {len(set(self._names))} pessoas")
 
     def identify(self, frame_rgb, locations=None):
-        if not FACE_OK or not self._encodings:
+        if not FACE_OK:
             return []
 
         try:
@@ -89,6 +93,9 @@ class FaceManager:
                 })
 
             return results
+        except ModuleNotFoundError as e:
+            print(f"[faces] erro: modelos não instalados ({e}). Execute: pip install git+https://github.com/ageitgey/face_recognition_models")
+            return []
         except Exception as e:
             print(f"[faces] erro ao identificar: {e}")
             return []
