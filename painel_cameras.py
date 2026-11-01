@@ -57,8 +57,8 @@ CAMERAS = {
         "onvif_porta": 8899,
         "inverter_pan": True,
         "inverter_tilt": False,
-        # HEVC 1080p: a cópia custa quase nada de CPU; recodificar custaria ~1 core
-        "gravar_h264": False
+        # recodificado para 640x360 H.264: 1080p HEVC em cópia gastava ~10 GB/dia
+        "gravar_h264": True
     },
     "garagem": {
         "nome": "Garagem",
@@ -477,6 +477,25 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
 .tabs a { color:var(--dim); text-decoration:none; font-size:13px; padding:7px 12px;
           border-radius:10px; border:1px solid var(--line); background:var(--card); }
 .tabs a.on { color:var(--txt); background:var(--card-2); }
+.painel-travado {
+  position:fixed; inset:0; z-index:300; background:#000; display:none; flex-direction:column;
+  padding: env(safe-area-inset-top) 12px env(safe-area-inset-bottom);
+}
+.painel-travado.on { display:flex; }
+.tr-topo { display:flex; justify-content:space-between; align-items:center; padding:14px 6px; color:#ccc; }
+.tr-titulo { font-size:14px; letter-spacing:.3px; }
+.tr-relogio { font-size:26px; font-weight:650; font-variant-numeric:tabular-nums; color:#fff; }
+.tr-grade { flex:1; min-height:0; display:grid; gap:8px; grid-template-columns:1fr; align-content:center; }
+@media (min-width:900px) { .tr-grade { grid-template-columns:1fr 1fr; } }
+.tr-cel { position:relative; background:#111; border-radius:12px; overflow:hidden; }
+.tr-cel canvas { width:100%; display:block; }
+.tr-cel .nome { position:absolute; left:8px; top:6px; font-size:12px; color:#fff;
+                background:rgba(0,0,0,.55); padding:2px 7px; border-radius:6px; }
+.tr-rodape { padding:12px 6px; display:flex; flex-direction:column; gap:10px; color:#bbb; font-size:13px; }
+.tr-botoes { display:flex; gap:8px; }
+.tr-botoes button { flex:1; padding:13px; border-radius:12px; border:1px solid var(--line);
+                    background:var(--card-2); color:var(--txt); font-size:15px; cursor:pointer; }
+.tr-botoes button.perigo { background:#3a1d1f; border-color:#5a2a2e; }
 .toast {
   position:fixed; left:50%; bottom:24px; transform:translateX(-50%) translateY(80px);
   background:#232a33; border:1px solid var(--line); color:var(--txt);
@@ -571,10 +590,26 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
   </div>
 </div>
 
+<div class="painel-travado" id="travado" aria-hidden="true">
+  <div class="tr-topo">
+    <span class="tr-titulo">Imagem travada</span>
+    <span class="tr-relogio" id="tr-relogio"></span>
+  </div>
+  <div class="tr-grade" id="tr-grade"></div>
+  <div class="tr-rodape">
+    <div id="tr-estado"></div>
+    <div class="tr-botoes">
+      <button id="tr-priv" class="perigo" onclick="alternarPrivacidade()">Ativar privacidade</button>
+      <button onclick="fecharTravado()">Fechar</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
 let camAtual = null;
+const CAMERAS_NOMES = {{ nomes|tojson }};
 
 function marcar(cid, ok) {
   const card = document.querySelector('[data-cam="' + cid + '"]');
@@ -671,6 +706,7 @@ document.querySelectorAll('[data-cam-feed]').forEach(img => {
   let active = true;
   img.dataset.useDetect = 'false';
   function poll() {
+    if (window.congelado) { setTimeout(poll, 400); return; }
     if (!active) return;
     const next = new Image();
     next.onload = () => {
@@ -739,6 +775,97 @@ function aguardarVoltar() {
   }, 1500);
 }
 
+// --- painel travado: segurar o título "Cameras" por ~2 s (escondido de propósito)
+let estadoPriv = {ativo: false, desde: null};
+let relogioTimer = null;
+
+function atualizarEstadoPriv() {
+  const est = document.getElementById('tr-estado');
+  const btn = document.getElementById('tr-priv');
+  if (estadoPriv.ativo) {
+    const h = new Date(estadoPriv.desde * 1000).toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'});
+    est.textContent = 'Privacidade ATIVA desde ' + h + ': gravação e vídeo pausados.';
+    btn.textContent = 'Desativar privacidade';
+  } else {
+    est.textContent = 'Gravação e vídeo ativos.';
+    btn.textContent = 'Ativar privacidade';
+  }
+}
+
+async function carregarEstadoPriv() {
+  try {
+    const r = await fetch('/privacidade', {cache: 'no-store'});
+    if (r.ok) estadoPriv = await r.json();
+  } catch (e) {}
+  atualizarEstadoPriv();
+}
+
+function desenharRelogio() {
+  document.getElementById('tr-relogio').textContent =
+    new Date().toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+
+function abrirTravado() {
+  window.congelado = true;
+  const grade = document.getElementById('tr-grade');
+  grade.innerHTML = '';
+  document.querySelectorAll('[data-cam-feed]').forEach(img => {
+    const cid = img.dataset.camFeed;
+    const cel = document.createElement('div');
+    cel.className = 'tr-cel';
+    const nome = document.createElement('span');
+    nome.className = 'nome';
+    nome.textContent = CAMERAS_NOMES[cid] || cid;
+    const cv = document.createElement('canvas');
+    if (img.complete && img.naturalWidth > 0) {
+      cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+      cv.getContext('2d').drawImage(img, 0, 0);
+    }
+    cel.appendChild(cv); cel.appendChild(nome);
+    grade.appendChild(cel);
+  });
+  desenharRelogio();
+  relogioTimer = setInterval(desenharRelogio, 500);
+  document.getElementById('travado').classList.add('on');
+  carregarEstadoPriv();
+}
+
+function fecharTravado() {
+  document.getElementById('travado').classList.remove('on');
+  clearInterval(relogioTimer);
+  window.congelado = false;
+}
+
+async function alternarPrivacidade() {
+  try {
+    const r = await fetch('/privacidade', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ativo: !estadoPriv.ativo})
+    });
+    const j = await r.json();
+    if (j.ok) { estadoPriv = j; atualizarEstadoPriv(); }
+    else aviso('Falha: ' + (j.erro || 'erro'));
+  } catch (e) {
+    aviso('Sem resposta do servidor');
+  }
+}
+
+(function () {
+  const alvo = document.querySelector('header h1');
+  let timer = null;
+  const cancelar = () => { clearTimeout(timer); timer = null; };
+  alvo.addEventListener('pointerdown', () => { timer = setTimeout(abrirTravado, 1800); });
+  alvo.addEventListener('pointerup', cancelar);
+  alvo.addEventListener('pointerleave', cancelar);
+  alvo.addEventListener('pointercancel', cancelar);
+  alvo.addEventListener('contextmenu', e => e.preventDefault());
+  alvo.style.userSelect = 'none';
+  alvo.style.webkitUserSelect = 'none';
+  alvo.style.webkitTouchCallout = 'none';
+})();
+document.addEventListener('keydown', e => { if (e.key === 'Escape') fecharTravado(); });
+
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 </script>
 </body>
@@ -767,7 +894,7 @@ ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">'
 @app.route("/")
 @auth.login_required
 def index():
-    return render_template_string(HTML, cameras=CAMERAS)
+    return render_template_string(HTML, cameras=CAMERAS, nomes=_opcoes_cameras())
 
 
 @app.route("/manifest.json")
@@ -791,8 +918,25 @@ def icone():
 def video(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
+    if gravacao.privacidade_ativa():
+        return "Privacidade ativa", 403
     return Response(streams.generate(cam_id),
                     mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+_PLACEHOLDER = None
+
+
+def _placeholder_jpeg():
+    """Imagem neutra servida no lugar do vídeo enquanto a privacidade está ativa."""
+    global _PLACEHOLDER
+    if _PLACEHOLDER is None:
+        img = np.zeros((360, 640, 3), dtype=np.uint8)
+        cv2.putText(img, "Privacidade ativa", (150, 185), cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0, (120, 120, 120), 2)
+        _, buf = cv2.imencode(".jpg", img)
+        _PLACEHOLDER = buf.tobytes()
+    return _PLACEHOLDER
 
 
 @app.route("/frame/<cam_id>")
@@ -800,6 +944,9 @@ def video(cam_id):
 def frame(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
+    if gravacao.privacidade_ativa():
+        return Response(_placeholder_jpeg(), mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
     streams.touch(cam_id)
     f = streams.last_frame[cam_id]
     if f is None:
@@ -813,6 +960,9 @@ def frame(cam_id):
 def frame_detect(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
+    if gravacao.privacidade_ativa():
+        return Response(_placeholder_jpeg(), mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
 
     detector = get_detector()
     if not detector:
@@ -847,6 +997,8 @@ def audio(cam_id):
         return "Camera nao encontrada", 404
     if not CAMERAS[cam_id].get("audio"):
         return "Camera sem audio", 404
+    if gravacao.privacidade_ativa():
+        return "Privacidade ativa", 403
     return Response(gerar_audio(cam_id), mimetype="audio/mpeg")
 
 
@@ -879,6 +1031,8 @@ def ptz_debug(cam_id):
 def snapshot(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
+    if gravacao.privacidade_ativa():
+        return "Privacidade ativa", 403
     cam = CAMERAS[cam_id]
     cmd = ["ffmpeg"]
     t = cam.get("transporte", "tcp")
@@ -904,7 +1058,7 @@ def comando_gravacao(cam_id, pasta_run):
         cmd += ["-rtsp_transport", t]
     cmd += ["-i", rtsp_url(cam), "-map", "0:v:0", "-an"]
     if cam.get("gravar_h264"):
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+        cmd += ["-vf", "scale=640:-2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
                 "-g", "48", "-pix_fmt", "yuv420p"]
     else:
         cmd += ["-c:v", "copy"]
@@ -995,6 +1149,24 @@ def gravacao_segmento(cam_id, run, nome):
     if not os.path.isfile(caminho):
         return "Nao encontrado", 404
     return send_file(caminho, mimetype="video/mp2t")
+
+
+@app.route("/privacidade", methods=["GET", "POST"])
+@auth.login_required
+def privacidade():
+    if request.method == "GET":
+        return jsonify(gravacao.privacidade_estado())
+    dados = request.get_json(silent=True) or {}
+    if not isinstance(dados.get("ativo"), bool):
+        return jsonify({"ok": False, "erro": "informe ativo: true ou false"}), 400
+    estado = gravacao.definir_privacidade(dados["ativo"])
+    if estado["ativo"]:
+        # derruba também os streams ao vivo que estiverem abertos
+        for c in CAMERAS:
+            with streams.locks[c]:
+                streams.running[c] = False
+                streams.viewers[c] = 0
+    return jsonify({"ok": True, **estado})
 
 
 @app.route("/restart", methods=["POST"])

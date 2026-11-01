@@ -9,6 +9,7 @@ primeira pasta marca o início de cada execução do ffmpeg. Quando o ffmpeg rei
 nova marca a quebra na linha do tempo.
 """
 
+import json
 import math
 import os
 import re
@@ -40,6 +41,56 @@ def _log(cam_id, msg):
     print(f"[{cam_id}] {msg}", flush=True)
 
 
+# ------------------------------------------------------------ PRIVACIDADE
+
+_priv_lock = threading.Lock()
+_priv = {"ativo": None, "desde": None}  # None = ainda não lido do disco
+_gravadores = []
+
+
+def _arquivo_privacidade():
+    return os.path.join(GRAVACAO_DIR, "privacidade.json")
+
+
+def privacidade_estado():
+    """{'ativo': bool, 'desde': epoch ou None}. Lido do disco na primeira vez, para
+    sobreviver a reinício do serviço."""
+    with _priv_lock:
+        if _priv["ativo"] is None:
+            try:
+                with open(_arquivo_privacidade()) as f:
+                    dados = json.load(f)
+                _priv["ativo"] = bool(dados.get("ativo"))
+                _priv["desde"] = dados.get("desde")
+            except (OSError, ValueError):
+                _priv["ativo"] = False
+                _priv["desde"] = None
+        return {"ativo": _priv["ativo"], "desde": _priv["desde"]}
+
+
+def privacidade_ativa():
+    return privacidade_estado()["ativo"]
+
+
+def definir_privacidade(ativo):
+    """Liga/desliga o modo privacidade. Ligado: para a gravação e o detector na hora."""
+    desde = time.time() if ativo else None
+    os.makedirs(GRAVACAO_DIR, exist_ok=True)
+    tmp = _arquivo_privacidade() + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"ativo": bool(ativo), "desde": desde}, f)
+    os.replace(tmp, _arquivo_privacidade())
+    with _priv_lock:
+        _priv["ativo"] = bool(ativo)
+        _priv["desde"] = desde
+    if ativo:
+        for g in _gravadores:
+            g.pausar()
+    print(f"[privacidade] {'ATIVADA: gravação e detecção paradas' if ativo else 'desativada'}",
+          flush=True)
+    return privacidade_estado()
+
+
 class Gravador(threading.Thread):
     """Mantém um ffmpeg de gravação rodando para uma câmera, reiniciando se ele cair."""
 
@@ -50,8 +101,15 @@ class Gravador(threading.Thread):
         self.on_frame = on_frame
         self.proc = None
 
+    def pausar(self):
+        """Chamado quando a privacidade liga: mata o ffmpeg. O loop não reinicia enquanto
+        a privacidade estiver ativa."""
+        self._matar()
+
     def run(self):
         while True:
+            while privacidade_ativa():
+                time.sleep(2)
             run_dir = os.path.join(pasta_cam(self.cam_id), time.strftime(FORMATO_TEMPO))
             os.makedirs(run_dir, exist_ok=True)
             cmd = self.build_cmd(self.cam_id, run_dir)
@@ -72,7 +130,7 @@ class Gravador(threading.Thread):
         buf = b""
         while True:
             chunk = proc.stdout.read(65536)
-            if not chunk:
+            if not chunk or privacidade_ativa():
                 break
             buf += chunk
             while True:
@@ -146,7 +204,9 @@ def iniciar(cam_ids, build_cmd, on_frame):
     os.makedirs(GRAVACAO_DIR, exist_ok=True)
     for cam_id in cam_ids:
         os.makedirs(pasta_cam(cam_id), exist_ok=True)
-        Gravador(cam_id, build_cmd, on_frame).start()
+        g = Gravador(cam_id, build_cmd, on_frame)
+        _gravadores.append(g)
+        g.start()
     threading.Thread(target=_loop_limpeza, args=(list(cam_ids),), daemon=True,
                      name="gravacao-limpeza").start()
     print(f"[gravacao] {len(cam_ids)} câmera(s), retenção {RETENCAO_S / 3600:.0f} h, "
