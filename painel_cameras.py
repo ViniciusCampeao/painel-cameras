@@ -1065,7 +1065,7 @@ def comando_gravacao(cam_id, pasta_run):
     cmd += ["-f", "segment", "-segment_time", str(gravacao.SEGMENTO_S),
             "-segment_format", "mpegts", "-strftime", "1",
             os.path.join(pasta_run, "%Y%m%d_%H%M%S.ts")]
-    cmd += ["-map", "0:v:0", "-an", "-vf", "fps=1,scale=640:-2",
+    cmd += ["-map", "0:v:0", "-an", "-vf", "fps=1/2,scale=640:-2",
             "-c:v", "mjpeg", "-q:v", "6", "-f", "image2pipe", "pipe:1"]
     return cmd
 
