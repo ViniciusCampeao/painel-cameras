@@ -188,6 +188,30 @@ seu_usuario ALL=(root) NOPASSWD: /usr/bin/systemctl restart --no-block painel-ca
 Sem essa linha em `/etc/sudoers.d/`, o botão de restart no painel não funciona (o resto do
 painel funciona normal).
 
+## Gravação e registro
+
+Cada câmera grava continuamente em arquivos de 5 minutos (`SEGMENTO_S`), e as gravações
+ficam guardadas por 24 h (`RETENCAO_HORAS`). Depois disso, o próprio painel apaga.
+
+- **Cozinha**: grava o stream HEVC em cópia (quase zero de CPU). Toca nativamente em
+  Safari/iPhone; Chrome em Linux pode não tocar H.265.
+- **Garagem**: o stream UDP não grava em cópia, então é recodificado para H.264 640×360
+  (custo baixo de CPU). Toca em qualquer navegador.
+
+Abas do painel:
+
+- **Ao vivo**: o painel de sempre.
+- **Registros**: pessoas detectadas (YOLO, classe `person`), com miniatura e horário.
+  Um evento começa na primeira detecção e fecha depois de `REGISTRO_GAP_S` sem ver ninguém.
+  O registro fica salvo mesmo depois que o vídeo é apagado.
+- **Gravações**: player com barra de tempo sobre toda a retenção. Clicar num registro abre
+  o player no horário do evento; o campo "Ir para o horário" e os botões de ±1/±10 min
+  permitem andar livremente.
+
+Os arquivos ficam em `GRAVACAO_DIR` (padrão `~/gravacoes`, fora do repositório). Para mover
+para um HD externo, monte o disco, aponte `GRAVACAO_DIR` pra ele e reinicie o serviço, ou
+copie as pastas `cozinha/`, `garagem/` e `registros/` antes de 24 h passarem.
+
 ## Segurança
 
 - O `.env` nunca deve ir pro repositório — está no `.gitignore` por isso. Use o `.env.example`

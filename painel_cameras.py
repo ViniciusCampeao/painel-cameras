@@ -1,4 +1,4 @@
-from flask import Flask, Response, render_template_string, jsonify, request
+from flask import Flask, Response, render_template_string, jsonify, request, send_file
 from flask_httpauth import HTTPBasicAuth
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
@@ -27,6 +27,10 @@ except Exception as e:
     print(f"[init] Detector não disponível: {e}")
     DETECTOR_OK = False
 
+import gravacao
+import registro
+from paginas_gravacao import REGISTROS_HTML, GRAVACOES_HTML
+
 app = Flask(__name__)
 auth = HTTPBasicAuth()
 
@@ -52,7 +56,9 @@ CAMERAS = {
         "audio": False,
         "onvif_porta": 8899,
         "inverter_pan": True,
-        "inverter_tilt": False
+        "inverter_tilt": False,
+        # HEVC 1080p: a cópia custa quase nada de CPU; recodificar custaria ~1 core
+        "gravar_h264": False
     },
     "garagem": {
         "nome": "Garagem",
@@ -66,7 +72,9 @@ CAMERAS = {
         "audio": True,
         "onvif_porta": 50000,
         "inverter_pan": False,
-        "inverter_tilt": False
+        "inverter_tilt": False,
+        # UDP sem timestamps válidos não grava HEVC em cópia; 640x360 recodificado é barato
+        "gravar_h264": True
     }
 }
 
@@ -465,6 +473,10 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
 .zoom { display:flex; flex-direction:column; gap:6px; }
 .zbtn { width:42px; height:42px; font-size:19px; font-weight:500; }
 
+.tabs { display:flex; gap:6px; padding:0 18px 10px; }
+.tabs a { color:var(--dim); text-decoration:none; font-size:13px; padding:7px 12px;
+          border-radius:10px; border:1px solid var(--line); background:var(--card); }
+.tabs a.on { color:var(--txt); background:var(--card-2); }
 .toast {
   position:fixed; left:50%; bottom:24px; transform:translateX(-50%) translateY(80px);
   background:#232a33; border:1px solid var(--line); color:var(--txt);
@@ -498,6 +510,12 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
   </div>
   <button class="restart-btn" id="restartBtn" onclick="confirmarRestart()" title="Reiniciar servico">&#8635;</button>
 </header>
+
+<nav class="tabs">
+  <a class="on" href="/">Ao vivo</a>
+  <a href="/registros">Registros</a>
+  <a href="/gravacoes">Gravações</a>
+</nav>
 
 <div class="wrap">
   {% for cid, cam in cameras.items() %}
@@ -874,6 +892,111 @@ def snapshot(cam_id):
         return "Erro ao capturar snapshot", 500
 
 
+# ------------------------------------------------- GRAVAÇÃO E REGISTRO
+
+def comando_gravacao(cam_id, pasta_run):
+    """ffmpeg com duas saídas: segmentos .ts da gravação e 1 quadro/s para o detector."""
+    cam = CAMERAS[cam_id]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-fflags", "+genpts+discardcorrupt+igndts"]
+    t = cam.get("transporte", "tcp")
+    if t in ("tcp", "udp"):
+        cmd += ["-rtsp_transport", t]
+    cmd += ["-i", rtsp_url(cam), "-map", "0:v:0", "-an"]
+    if cam.get("gravar_h264"):
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28",
+                "-g", "48", "-pix_fmt", "yuv420p"]
+    else:
+        cmd += ["-c:v", "copy"]
+    cmd += ["-f", "segment", "-segment_time", str(gravacao.SEGMENTO_S),
+            "-segment_format", "mpegts", "-strftime", "1",
+            os.path.join(pasta_run, "%Y%m%d_%H%M%S.ts")]
+    cmd += ["-map", "0:v:0", "-an", "-vf", "fps=1,scale=640:-2",
+            "-c:v", "mjpeg", "-q:v", "6", "-f", "image2pipe", "pipe:1"]
+    return cmd
+
+
+def _opcoes_cameras():
+    # só o nome: CAMERAS tem host e senha e não pode ir para o template
+    return {cid: c["nome"] for cid, c in CAMERAS.items()}
+
+
+@app.route("/registros")
+@auth.login_required
+def registros_page():
+    return render_template_string(REGISTROS_HTML, opcoes=_opcoes_cameras())
+
+
+@app.route("/gravacoes")
+@auth.login_required
+def gravacoes_page():
+    cam = request.args.get("cam", "")
+    if cam not in CAMERAS:
+        cam = next(iter(CAMERAS))
+    try:
+        t = float(request.args["t"]) if request.args.get("t") else None
+    except ValueError:
+        t = None
+    return render_template_string(GRAVACOES_HTML, opcoes=_opcoes_cameras(),
+                                  cam_inicial=cam, t_inicial=t)
+
+
+@app.route("/api/registros")
+@auth.login_required
+def api_registros():
+    cam = request.args.get("cam") or None
+    if cam and cam not in CAMERAS:
+        return jsonify([])
+    itens = registro.listar(cam)
+    for it in itens:
+        it["cam_nome"] = CAMERAS[it["cam"]]["nome"]
+        it["miniatura_url"] = f"/registro/{it['id']}/imagem"
+    return jsonify(itens)
+
+
+@app.route("/registro/<int:eid>/imagem")
+@auth.login_required
+def registro_imagem(eid):
+    caminho = registro.miniatura_caminho(eid)
+    if not caminho:
+        return "", 404
+    return send_file(caminho, mimetype="image/jpeg")
+
+
+@app.route("/gravacao/<cam_id>/playlist.m3u8")
+@auth.login_required
+def gravacao_playlist(cam_id):
+    if cam_id not in CAMERAS:
+        return "Camera nao encontrada", 404
+    texto = gravacao.playlist(cam_id)
+    if texto is None:
+        return "Sem gravacao disponivel", 404
+    return Response(texto, mimetype="application/vnd.apple.mpegurl",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.route("/gravacao/<cam_id>/segmentos")
+@auth.login_required
+def gravacao_segmentos(cam_id):
+    if cam_id not in CAMERAS:
+        return jsonify({"erro": "camera invalida"}), 404
+    segs = gravacao.segmentos(cam_id)
+    return jsonify({"segmentos": [{"i": s["i"], "d": s["d"], "quebra": s["quebra"]}
+                                  for s in segs]})
+
+
+@app.route("/gravacao/<cam_id>/<run>/<nome>")
+@auth.login_required
+def gravacao_segmento(cam_id, run, nome):
+    if (cam_id not in CAMERAS or not gravacao.RE_RUN.match(run)
+            or not gravacao.RE_SEG.match(nome)):
+        return "Nao encontrado", 404
+    caminho = os.path.join(gravacao.pasta_cam(cam_id), run, nome)
+    if not os.path.isfile(caminho):
+        return "Nao encontrado", 404
+    return send_file(caminho, mimetype="video/mp2t")
+
+
 @app.route("/restart", methods=["POST"])
 @auth.login_required
 def restart():
@@ -896,4 +1019,6 @@ def status():
 
 
 if __name__ == "__main__":
+    gravacao.iniciar(list(CAMERAS), comando_gravacao, registro.enfileirar)
+    registro.iniciar(get_detector)
     app.run(host="0.0.0.0", port=5055, debug=False, threaded=True)

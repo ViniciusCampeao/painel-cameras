@@ -38,6 +38,14 @@ class Detector:
                 print(f"[detector] erro ao carregar YOLO: {e}")
 
 
+    def pessoas(self, frame, conf=0.45):
+        """Caixas (confiança, (x1, y1, x2, y2)) só da classe 'person'. Usado pelo registro."""
+        if not self.model:
+            return []
+        with self._lock:
+            res = self.model(frame, conf=conf, classes=[0], verbose=False)[0]
+            return [(float(b.conf[0]), tuple(map(int, b.xyxy[0]))) for b in res.boxes]
+
     def process(self, frame):
         if not self.model:
             return frame
