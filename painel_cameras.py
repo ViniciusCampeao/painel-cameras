@@ -29,7 +29,9 @@ except Exception as e:
 
 import gravacao
 import registro
+import rostos
 from paginas_gravacao import REGISTROS_HTML, GRAVACOES_HTML
+from paginas_rostos import ROSTOS_HTML
 
 app = Flask(__name__)
 auth = HTTPBasicAuth()
@@ -533,6 +535,7 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
 <nav class="tabs">
   <a class="on" href="/">Ao vivo</a>
   <a href="/registros">Registros</a>
+  <a href="/rostos">Rostos</a>
   <a href="/gravacoes">Gravações</a>
 </nav>
 
@@ -1117,6 +1120,42 @@ def registro_imagem(eid):
     return send_file(caminho, mimetype="image/jpeg")
 
 
+@app.route("/rostos")
+@auth.login_required
+def rostos_page():
+    return render_template_string(ROSTOS_HTML)
+
+
+@app.route("/api/rostos")
+@auth.login_required
+def api_rostos():
+    status = request.args.get("status") or None
+    if status not in (None, "pendente", "rotulado"):
+        status = None
+    return jsonify(rostos.listar(status))
+
+
+@app.route("/rosto/<int:rid>/imagem")
+@auth.login_required
+def rosto_imagem(rid):
+    caminho = rostos.thumb_caminho(rid)
+    if not caminho:
+        return "", 404
+    return send_file(caminho, mimetype="image/jpeg")
+
+
+@app.route("/api/rosto/<int:rid>/rotular", methods=["POST"])
+@auth.login_required
+def api_rosto_rotular(rid):
+    dados = request.get_json(silent=True) or {}
+    rotulo = dados.get("rotulo")
+    nome = dados.get("nome")
+    if rotulo not in ("morador", "estranho", "conhecido"):
+        return jsonify({"ok": False, "erro": "rótulo inválido"}), 400
+    ok = rostos.rotular(rid, rotulo, nome)
+    return jsonify({"ok": ok, "erro": None if ok else "rosto não encontrado"})
+
+
 @app.route("/gravacao/<cam_id>/playlist.m3u8")
 @auth.login_required
 def gravacao_playlist(cam_id):
@@ -1192,5 +1231,6 @@ def status():
 
 if __name__ == "__main__":
     gravacao.iniciar(list(CAMERAS), comando_gravacao, registro.enfileirar)
+    rostos.iniciar_banco()
     registro.iniciar(get_detector)
     app.run(host="0.0.0.0", port=5055, debug=False, threaded=True)

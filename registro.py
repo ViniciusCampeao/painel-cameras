@@ -17,6 +17,12 @@ import numpy as np
 
 from gravacao import GRAVACAO_DIR, intervalos_video
 
+try:
+    import rostos
+except Exception as _e:  # pragma: no cover
+    rostos = None
+    print(f"[registro] módulo de rostos indisponível: {_e}", flush=True)
+
 GAP_S = float(os.environ.get("REGISTRO_GAP_S", "30"))
 CONFIANCA = float(os.environ.get("REGISTRO_CONFIANCA", "0.45"))
 # De quanto em quanto tempo varrer eventos sem gravação correspondente.
@@ -63,6 +69,17 @@ def _salvar_miniatura(cam_id, frame, boxes, ts):
     return rel
 
 
+def _capturar_rostos(cam_id, frame, boxes, ts, ativo):
+    """Procura rostos nas pessoas do frame e guarda os novos como pendentes."""
+    if rostos is None:
+        return
+    try:
+        coords = [b for _, b in boxes]
+        rostos.capturar(cam_id, frame, coords, ts, ativo["id"], ativo["rostos"])
+    except Exception as e:
+        print(f"[registro] captura de rosto falhou ({cam_id}): {e}", flush=True)
+
+
 def _registrar(cam_id, frame, boxes, ts):
     ativo = _ativo.get(cam_id)
     if not boxes:
@@ -78,8 +95,10 @@ def _registrar(cam_id, frame, boxes, ts):
                             " VALUES (?, ?, ?, 1, ?, ?)", (cam_id, ts, ts, conf, miniatura))
             c.commit()
             eid = cur.lastrowid
-        _ativo[cam_id] = {"id": eid, "ultimo": ts, "n": 1, "conf": conf}
+        ativo = {"id": eid, "ultimo": ts, "n": 1, "conf": conf, "rostos": []}
+        _ativo[cam_id] = ativo
         print(f"[registro] {cam_id}: pessoa detectada (evento {eid})", flush=True)
+        _capturar_rostos(cam_id, frame, boxes, ts, ativo)
         return
 
     ativo["ultimo"] = ts
@@ -89,6 +108,7 @@ def _registrar(cam_id, frame, boxes, ts):
         c.execute("UPDATE eventos SET fim = ?, deteccoes = ?, confianca = ? WHERE id = ?",
                   (ts, ativo["n"], ativo["conf"], ativo["id"]))
         c.commit()
+    _capturar_rostos(cam_id, frame, boxes, ts, ativo)
 
 
 def enfileirar(cam_id, jpg, ts):
@@ -167,6 +187,19 @@ def limpar_orfaos():
             c.execute("DELETE FROM eventos WHERE id = ?", (r["id"],))
         c.commit()
     print(f"[registro] limpeza: {len(orfaos)} evento(s) órfão(s) removido(s)", flush=True)
+
+    # rostos PENDENTES de eventos que já não existem também vão embora
+    # (rostos já rotulados ficam: são a base do reconhecimento)
+    if rostos is not None:
+        try:
+            with _db_lock, closing(_conexao()) as c:
+                vivos = {row[0] for row in c.execute("SELECT id FROM eventos")}
+            n = rostos.remover_pendentes_orfaos(vivos)
+            if n:
+                print(f"[registro] limpeza: {n} rosto(s) pendente(s) órfão(s) removido(s)",
+                      flush=True)
+        except Exception as e:
+            print(f"[registro] limpeza de rostos falhou: {e}", flush=True)
     return len(orfaos)
 
 

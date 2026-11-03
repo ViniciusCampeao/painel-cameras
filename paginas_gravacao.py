@@ -51,6 +51,7 @@ REGISTROS_HTML = """<!DOCTYPE html>
   <nav>
     <a href="/">Ao vivo</a>
     <a class="on" href="/registros">Registros</a>
+    <a href="/rostos">Rostos</a>
     <a href="/gravacoes">Gravações</a>
   </nav>
 </header>
@@ -137,6 +138,7 @@ video { width:100%; max-height:70vh; background:#000; border-radius:14px; border
   <nav>
     <a href="/">Ao vivo</a>
     <a href="/registros">Registros</a>
+    <a href="/rostos">Rostos</a>
     <a class="on" href="/gravacoes">Gravações</a>
   </nav>
 </header>
