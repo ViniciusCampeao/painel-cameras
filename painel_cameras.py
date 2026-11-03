@@ -71,7 +71,7 @@ CAMERAS = {
         "senha": os.environ["CAM_GARAGEM_SENHA"],
         "path": "/onvif2",
         "audio_path": "/onvif1",
-        "transporte": "tcp",
+        "transporte": "udp",
         "ptz": False,
         "audio": True,
         "onvif_porta": 50000,
@@ -345,7 +345,10 @@ class LiveHLS:
 
     def _cmd(self, cam_id, saida):
         cam = CAMERAS[cam_id]
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer"]
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+               "-fflags", "nobuffer+discardcorrupt", "-err_detect", "ignore_err"]
+        if cam_id == "garagem":  # HEVC/UDP: descarta frames sem referencia
+            cmd += ["-discard", "bidir"]
         t = cam.get("transporte", "tcp")
         if t in ("tcp", "udp"):
             cmd += ["-rtsp_transport", t]
