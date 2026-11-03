@@ -191,6 +191,27 @@ def _limpar(cam_ids):
                 pass
 
 
+def intervalos_video(cam_id):
+    """(inicio, fim) de cada segmento .ts existente da câmera, para saber se ainda há
+    gravação cobrindo um instante (inclui o segmento que está sendo escrito agora)."""
+    base = pasta_cam(cam_id)
+    ivs = []
+    if os.path.isdir(base):
+        for run in os.listdir(base):
+            rd = os.path.join(base, run)
+            if not RE_RUN.match(run) or not os.path.isdir(rd):
+                continue
+            for nome in os.listdir(rd):
+                if RE_SEG.match(nome):
+                    try:
+                        ini = _epoch(nome[:15])
+                        ivs.append((ini, ini + SEGMENTO_S))
+                    except ValueError:
+                        pass
+    ivs.sort()
+    return ivs
+
+
 def _loop_limpeza(cam_ids):
     while True:
         try:

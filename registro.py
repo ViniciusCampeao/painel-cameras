@@ -15,10 +15,12 @@ from contextlib import closing
 import cv2
 import numpy as np
 
-from gravacao import GRAVACAO_DIR
+from gravacao import GRAVACAO_DIR, intervalos_video
 
 GAP_S = float(os.environ.get("REGISTRO_GAP_S", "30"))
 CONFIANCA = float(os.environ.get("REGISTRO_CONFIANCA", "0.45"))
+# De quanto em quanto tempo varrer eventos sem gravação correspondente.
+LIMPEZA_ORFAOS_S = float(os.environ.get("LIMPEZA_ORFAOS_S", "600"))
 DB = os.path.join(GRAVACAO_DIR, "registros.db")
 
 _db_lock = threading.Lock()
@@ -125,10 +127,63 @@ def _worker(get_detector):
             print(f"[registro] erro ao processar {cam_id}: {e}", flush=True)
 
 
+def _remover_miniatura(mini):
+    """Apaga o arquivo da miniatura, conferindo que fica dentro de GRAVACAO_DIR."""
+    if not mini:
+        return
+    base = os.path.realpath(GRAVACAO_DIR)
+    caminho = os.path.realpath(os.path.join(GRAVACAO_DIR, mini))
+    if caminho.startswith(base + os.sep) and os.path.isfile(caminho):
+        try:
+            os.remove(caminho)
+        except OSError:
+            pass
+
+
+def limpar_orfaos():
+    """Apaga eventos (e suas miniaturas) que não têm mais nenhuma gravação cobrindo o
+    instante do avistamento — tipicamente porque o vídeo já saiu pela retenção.
+    Retorna quantos eventos foram removidos."""
+    with _db_lock, closing(_conexao()) as c:
+        linhas = [dict(r) for r in c.execute(
+            "SELECT id, cam, inicio, miniatura FROM eventos").fetchall()]
+
+    cobertura = {}
+    orfaos = []
+    for r in linhas:
+        cam = r["cam"]
+        if cam not in cobertura:
+            cobertura[cam] = intervalos_video(cam)
+        ts = r["inicio"]
+        if not any(a <= ts < b for a, b in cobertura[cam]):
+            orfaos.append(r)
+
+    if not orfaos:
+        return 0
+
+    with _db_lock, closing(_conexao()) as c:
+        for r in orfaos:
+            _remover_miniatura(r["miniatura"])
+            c.execute("DELETE FROM eventos WHERE id = ?", (r["id"],))
+        c.commit()
+    print(f"[registro] limpeza: {len(orfaos)} evento(s) órfão(s) removido(s)", flush=True)
+    return len(orfaos)
+
+
+def _loop_orfaos():
+    while True:
+        time.sleep(LIMPEZA_ORFAOS_S)
+        try:
+            limpar_orfaos()
+        except Exception as e:
+            print(f"[registro] limpeza órfãos erro: {e}", flush=True)
+
+
 def iniciar(get_detector):
     iniciar_banco()
     threading.Thread(target=_worker, args=(get_detector,), daemon=True,
                      name="registro-detector").start()
+    threading.Thread(target=_loop_orfaos, daemon=True, name="registro-orfaos").start()
     print(f"[registro] ativo (lacuna {GAP_S:.0f} s, confiança {CONFIANCA:.2f})", flush=True)
 
 
