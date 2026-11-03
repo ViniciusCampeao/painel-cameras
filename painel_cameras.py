@@ -71,13 +71,13 @@ CAMERAS = {
         "senha": os.environ["CAM_GARAGEM_SENHA"],
         "path": "/onvif2",
         "audio_path": "/onvif1",
-        "transporte": "udp",
+        "transporte": "tcp",
         "ptz": False,
         "audio": True,
         "onvif_porta": 50000,
         "inverter_pan": False,
         "inverter_tilt": False,
-        # UDP sem timestamps válidos não grava HEVC em cópia; 640x360 recodificado é barato
+        # TCP garante ordem dos pacotes; gravar_h264 reencoda H.264, sem problema de timestamp
         "gravar_h264": True
     }
 }
