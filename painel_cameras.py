@@ -1132,7 +1132,7 @@ def api_rostos():
     status = request.args.get("status") or None
     if status not in (None, "pendente", "rotulado"):
         status = None
-    return jsonify(rostos.listar(status))
+    return jsonify(rostos.listar_grupos(status))
 
 
 @app.route("/rosto/<int:rid>/imagem")
@@ -1154,6 +1154,19 @@ def api_rosto_rotular(rid):
         return jsonify({"ok": False, "erro": "rótulo inválido"}), 400
     ok = rostos.rotular(rid, rotulo, nome)
     return jsonify({"ok": ok, "erro": None if ok else "rosto não encontrado"})
+
+
+@app.route("/api/grupo/<int:grupo>/rotular", methods=["POST"])
+@auth.login_required
+def api_grupo_rotular(grupo):
+    dados = request.get_json(silent=True) or {}
+    rotulo = dados.get("rotulo")
+    nome = dados.get("nome")
+    if rotulo not in ("morador", "estranho", "conhecido"):
+        return jsonify({"ok": False, "erro": "rótulo inválido"}), 400
+    n = rostos.rotular_grupo(grupo, rotulo, nome)
+    return jsonify({"ok": n > 0, "afetados": n,
+                    "erro": None if n > 0 else "grupo não encontrado"})
 
 
 @app.route("/gravacao/<cam_id>/playlist.m3u8")

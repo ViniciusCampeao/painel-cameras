@@ -1,5 +1,6 @@
-"""Página de Rostos: galeria de rostos capturados para rotular como morador,
-estranho ou com um nome. Rostos nomeados passam a ser reconhecidos sozinhos."""
+"""Página de Rostos: galeria de PESSOAS (rostos agrupados por semelhança) para
+rotular como morador, estranho ou com um nome. Rotular um grupo vale para todas
+as aparições daquela pessoa; quem recebe nome passa a ser reconhecido sozinho."""
 
 from paginas_gravacao import _BASE_CSS
 
@@ -14,7 +15,10 @@ ROSTOS_HTML = """<!DOCTYPE html>
 .filtros button.on { background:var(--card-2); color:var(--txt); border-color:var(--acc); }
 .grade { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:12px; }
 .rosto { background:var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+.thumb { position:relative; }
 .rosto img { width:100%; aspect-ratio:1/1; object-fit:cover; background:#000; display:block; }
+.badge { position:absolute; top:6px; right:6px; background:rgba(10,12,15,.8); color:#fff;
+         font-size:11px; font-weight:600; padding:3px 7px; border-radius:999px; }
 .rosto .corpo { padding:8px 10px 10px; display:flex; flex-direction:column; gap:6px; }
 .rosto .cam { font-size:11px; color:var(--acc); font-weight:600; text-transform:uppercase; letter-spacing:.4px; }
 .rosto .hora { font-size:12px; color:var(--dim); }
@@ -72,14 +76,17 @@ function setFiltro(f) {
 }
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
 
-async function rotular(id, rotulo, nome) {
+async function rotular(it, rotulo, nome) {
+  const url = (it.grupo != null)
+    ? '/api/grupo/' + it.grupo + '/rotular'
+    : '/api/rosto/' + it.rep_id + '/rotular';
   try {
-    const r = await fetch('/api/rosto/' + id + '/rotular', {
+    const r = await fetch(url, {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({rotulo: rotulo, nome: nome || null})
     });
     const j = await r.json();
-    if (j.ok) { aviso('Salvo'); carregar(); }
+    if (j.ok) { aviso(j.afetados ? ('Salvo (' + j.afetados + ' fotos)') : 'Salvo'); carregar(); }
     else aviso('Falha: ' + (j.erro || 'erro'));
   } catch (e) { aviso('Sem resposta'); }
 }
@@ -92,22 +99,22 @@ async function carregar() {
     const r = await fetch('/api/rostos' + (filtro ? '?status=' + filtro : ''), {cache:'no-store'});
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const itens = await r.json();
-    st.textContent = itens.length + ' rosto(s)';
+    st.textContent = itens.length + ' pessoa(s)';
     grade.innerHTML = '';
     if (!itens.length) {
-      grade.innerHTML = '<p class="aviso">Nenhum rosto ' +
-        (filtro === 'pendente' ? 'pendente' : filtro === 'rotulado' ? 'rotulado' : '') +
+      grade.innerHTML = '<p class="aviso">Nenhuma pessoa ' +
+        (filtro === 'pendente' ? 'pendente' : filtro === 'rotulado' ? 'rotulada' : '') +
         ' ainda. Rostos aparecem aqui quando alguém é filmado de frente.</p>';
       return;
     }
     for (const it of itens) {
       const card = document.createElement('div');
       card.className = 'rosto';
+      const badge = it.total > 1 ? '<span class="badge">' + it.total + ' fotos</span>' : '';
       let corpo = '<div class="corpo">';
-      corpo += '<span class="cam">' + esc(it.cam) + '</span>';
-      corpo += '<span class="hora">' + fmtData(it.ts) + '</span>';
-      if (it.auto_nome) corpo += '<span class="auto">parece: ' + esc(it.auto_nome) +
-        (it.auto_dist != null ? ' (' + it.auto_dist + ')' : '') + '</span>';
+      corpo += '<span class="cam">' + esc((it.cams || []).join(', ')) + '</span>';
+      corpo += '<span class="hora">última: ' + fmtData(it.ts) + '</span>';
+      if (it.auto_nome && !it.rotulo) corpo += '<span class="auto">parece: ' + esc(it.auto_nome) + '</span>';
       if (it.rotulo) {
         const txt = it.nome ? esc(it.nome) : (it.rotulo === 'morador' ? 'Morador' :
                     it.rotulo === 'estranho' ? 'Estranho' : 'Conhecido');
@@ -119,14 +126,15 @@ async function carregar() {
       corpo += '<div class="nomerow"><input placeholder="nome..." value="' + esc(it.nome || '') +
         '"><button data-a="nome">Salvar</button></div>';
       corpo += '</div>';
-      card.innerHTML = '<img loading="lazy" alt="rosto" src="/rosto/' + it.id + '/imagem">' + corpo;
+      card.innerHTML = '<div class="thumb"><img loading="lazy" alt="rosto" src="/rosto/' +
+        it.rep_id + '/imagem">' + badge + '</div>' + corpo;
       card.querySelector('[data-a="morador"]').onclick = () =>
-        rotular(it.id, 'morador', card.querySelector('.nomerow input').value.trim());
-      card.querySelector('[data-a="estranho"]').onclick = () => rotular(it.id, 'estranho', null);
+        rotular(it, 'morador', card.querySelector('.nomerow input').value.trim());
+      card.querySelector('[data-a="estranho"]').onclick = () => rotular(it, 'estranho', null);
       card.querySelector('[data-a="nome"]').onclick = () => {
         const nome = card.querySelector('.nomerow input').value.trim();
         if (!nome) { aviso('Digite um nome'); return; }
-        rotular(it.id, 'conhecido', nome);
+        rotular(it, 'conhecido', nome);
       };
       grade.appendChild(card);
     }

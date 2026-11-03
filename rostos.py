@@ -31,6 +31,8 @@ TOLERANCIA = float(os.environ.get("FACE_TOLERANCIA", "0.6"))
 DEDUP = float(os.environ.get("FACE_DEDUP", "0.5"))
 # no máximo quantos rostos distintos salvar por evento
 MAX_POR_EVENTO = int(os.environ.get("FACE_MAX_POR_EVENTO", "6"))
+# distância máxima para juntar dois rostos no MESMO grupo (pessoa), entre eventos
+AGRUPAR = float(os.environ.get("FACE_AGRUPAR", "0.55"))
 # lado mínimo do recorte da pessoa antes de procurar rosto (amplia se menor)
 ALVO_LADO = 160
 
@@ -102,9 +104,16 @@ def iniciar_banco():
                        rotulo TEXT,        -- 'morador' | 'estranho' | 'conhecido' | NULL
                        nome TEXT,          -- nome livre (quando informado)
                        auto_nome TEXT,     -- nome reconhecido automaticamente
-                       auto_dist REAL)""")
+                       auto_dist REAL,
+                       grupo INTEGER)""")
+        # migração: adiciona 'grupo' em bancos criados antes desta coluna existir
+        cols = {r[1] for r in c.execute("PRAGMA table_info(rostos)")}
+        if "grupo" not in cols:
+            c.execute("ALTER TABLE rostos ADD COLUMN grupo INTEGER")
         c.execute("CREATE INDEX IF NOT EXISTS ix_rostos_ts ON rostos(ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_rostos_grupo ON rostos(grupo)")
         c.commit()
+    backfill_grupos()
 
 
 # --------------------------------------------------------------- encodings
@@ -144,6 +153,59 @@ def _reconhecer(e, conhecidos):
     if d[i] <= TOLERANCIA:
         return nomes[i], round(float(d[i]), 3)
     return None, round(float(d[i]), 3)
+
+
+# --------------------------------------------------------------- agrupamento
+
+def _carregar_grupos(c):
+    """[(grupo, encoding, rotulo, nome)] dos rostos que já têm grupo."""
+    rows = c.execute("SELECT grupo, encoding, rotulo, nome FROM rostos "
+                     "WHERE grupo IS NOT NULL AND encoding IS NOT NULL").fetchall()
+    out = []
+    for r in rows:
+        v = _bytes_para_enc(r["encoding"])
+        if v is not None:
+            out.append((r["grupo"], v, r["rotulo"], r["nome"]))
+    return out
+
+
+def _escolher_grupo(e, grupos):
+    """Grupo mais próximo dentro de AGRUPAR. Retorna (grupo, rotulo, nome) ou
+    (None, None, None)."""
+    melhor = None
+    for g, v, rot, nome in grupos:
+        d = np.linalg.norm(v - e)
+        if d <= AGRUPAR and (melhor is None or d < melhor[0]):
+            melhor = (d, g, rot, nome)
+    return (melhor[1], melhor[2], melhor[3]) if melhor else (None, None, None)
+
+
+def _novo_grupo(c):
+    mx = c.execute("SELECT COALESCE(MAX(grupo), 0) FROM rostos").fetchone()[0]
+    return int(mx) + 1
+
+
+def backfill_grupos():
+    """Atribui grupo aos rostos que ainda não têm (bancos anteriores à coluna).
+    Processa em ordem de ts, juntando cada um ao grupo mais próximo ou criando um."""
+    with _db_lock, closing(_conexao()) as c:
+        pendentes = c.execute("SELECT id, encoding FROM rostos "
+                              "WHERE grupo IS NULL AND encoding IS NOT NULL "
+                              "ORDER BY ts").fetchall()
+        n = 0
+        for row in pendentes:
+            e = _bytes_para_enc(row["encoding"])
+            if e is None:
+                continue
+            grupo, _, _ = _escolher_grupo(e, _carregar_grupos(c))
+            if grupo is None:
+                grupo = _novo_grupo(c)
+            c.execute("UPDATE rostos SET grupo = ? WHERE id = ?", (grupo, row["id"]))
+            n += 1
+        c.commit()
+    if n:
+        print(f"[rostos] backfill: {n} rosto(s) agrupado(s)", flush=True)
+    return n
 
 
 # --------------------------------------------------------------- detecção
@@ -210,9 +272,17 @@ def capturar(cam, frame_bgr, boxes, ts, evento_id, vistos):
         auto_nome, auto_dist = _reconhecer(e, conhecidos)
         rel = _salvar_thumb(cam, rosto_bgr, ts, len(vistos))
         with _db_lock, closing(_conexao()) as c:
+            grupo, g_rot, g_nome = _escolher_grupo(e, _carregar_grupos(c))
+            if grupo is None:
+                grupo = _novo_grupo(c)
+            # grupo já rotulado: o novo rosto herda rótulo/nome e não vira pendente
+            if g_nome and not auto_nome:
+                auto_nome = g_nome
             c.execute("INSERT INTO rostos (cam, ts, evento_id, thumb, encoding, "
-                      "auto_nome, auto_dist) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (cam, ts, evento_id, rel, _enc_para_bytes(e), auto_nome, auto_dist))
+                      "auto_nome, auto_dist, grupo, rotulo, nome) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      (cam, ts, evento_id, rel, _enc_para_bytes(e), auto_nome, auto_dist,
+                       grupo, g_rot, g_nome))
             c.commit()
         salvos += 1
     return salvos
@@ -221,7 +291,7 @@ def capturar(cam, frame_bgr, boxes, ts, evento_id, vistos):
 # --------------------------------------------------------------- API painel
 
 def listar(status=None, limite=300):
-    sql = ("SELECT id, cam, ts, evento_id, rotulo, nome, auto_nome, auto_dist "
+    sql = ("SELECT id, cam, ts, evento_id, rotulo, nome, auto_nome, auto_dist, grupo "
            "FROM rostos")
     cond, args = [], []
     if status == "pendente":
@@ -236,6 +306,41 @@ def listar(status=None, limite=300):
         return [dict(r) for r in c.execute(sql, args).fetchall()]
 
 
+def listar_grupos(status=None, limite=500):
+    """Agrupa os rostos por pessoa (coluna grupo) e devolve um item por grupo:
+    representante (rosto mais recente), total de aparições, câmeras e rótulo."""
+    rows = listar(None, limite=5000)
+    grupos = {}
+    for r in rows:
+        chave = r["grupo"] if r["grupo"] is not None else f"i{r['id']}"
+        g = grupos.get(chave)
+        if g is None:
+            g = {"grupo": r["grupo"], "rep_id": r["id"], "total": 0, "ts": r["ts"],
+                 "cams": set(), "rotulo": None, "nome": None, "auto_nome": None}
+            grupos[chave] = g
+        g["total"] += 1
+        g["cams"].add(r["cam"])
+        if r["ts"] >= g["ts"]:
+            g["ts"], g["rep_id"] = r["ts"], r["id"]  # representante = mais recente
+        if r["rotulo"] and not g["rotulo"]:
+            g["rotulo"] = r["rotulo"]
+        if r["nome"] and not g["nome"]:
+            g["nome"] = r["nome"]
+        if r["auto_nome"] and not g["auto_nome"]:
+            g["auto_nome"] = r["auto_nome"]
+    saida = []
+    for g in grupos.values():
+        rotulado = g["rotulo"] is not None
+        if status == "pendente" and rotulado:
+            continue
+        if status == "rotulado" and not rotulado:
+            continue
+        g["cams"] = sorted(g["cams"])
+        saida.append(g)
+    saida.sort(key=lambda x: x["ts"], reverse=True)
+    return saida[:limite]
+
+
 def rotular(rid, rotulo, nome=None):
     """Define rótulo (morador/estranho/conhecido) e/ou nome de um rosto.
     Qualquer rosto com nome vira referência para o reconhecimento automático."""
@@ -247,6 +352,18 @@ def rotular(rid, rotulo, nome=None):
                         (rotulo, nome, rid))
         c.commit()
     return cur.rowcount > 0
+
+
+def rotular_grupo(grupo, rotulo, nome=None):
+    """Aplica rótulo/nome a TODOS os rostos de um grupo (pessoa). Retorna quantos."""
+    nome = (nome or "").strip() or None
+    if rotulo not in ("morador", "estranho", "conhecido"):
+        return 0
+    with _db_lock, closing(_conexao()) as c:
+        cur = c.execute("UPDATE rostos SET rotulo = ?, nome = ? WHERE grupo = ?",
+                        (rotulo, nome, grupo))
+        c.commit()
+    return cur.rowcount
 
 
 def thumb_caminho(rid):
