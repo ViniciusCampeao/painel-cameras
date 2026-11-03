@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import threading
@@ -10,6 +11,12 @@ except ImportError:
     YOLO_OK = False
 
 FACE_OK = False  # Face recognition desabilitado
+
+# Modelo e resolução de inferência (configuráveis por env).
+# yolo11s @ imgsz=480 venceu o benchmark nestas câmeras 360p: recall 90% vs 74%
+# do yolov8n, +26% de detecções, e mais barato que @640 (que faz upscale do 360p).
+MODELO_YOLO = os.environ.get("MODELO_YOLO", "yolo11s.pt")
+DETECTOR_IMGSZ = int(os.environ.get("DETECTOR_IMGSZ", "480"))
 
 
 class FaceManager:
@@ -32,15 +39,14 @@ class Detector:
 
         if YOLO_OK:
             try:
-                self.model = YOLO("yolov8n.pt")
-                print("[detector] YOLO carregado")
+                self.model = YOLO(MODELO_YOLO)
+                print(f"[detector] YOLO carregado: {MODELO_YOLO} (imgsz={DETECTOR_IMGSZ})")
             except Exception as e:
                 print(f"[detector] erro ao carregar YOLO: {e}")
 
 
-    def pessoas(self, frame, conf=0.45, imgsz=480):
-        """Caixas (confiança, (x1, y1, x2, y2)) só da classe 'person'. Usado pelo registro.
-        imgsz=480: metade do custo do 640, com confiança praticamente igual."""
+    def pessoas(self, frame, conf=0.45, imgsz=DETECTOR_IMGSZ):
+        """Caixas (confiança, (x1, y1, x2, y2)) só da classe 'person'. Usado pelo registro."""
         if not self.model:
             return []
         with self._lock:
@@ -66,7 +72,7 @@ class Detector:
             return
 
         try:
-            results = self.model(frame, conf=0.45, verbose=False)[0]
+            results = self.model(frame, conf=0.45, verbose=False, imgsz=DETECTOR_IMGSZ)[0]
             detections = []
             has_person = False
 
