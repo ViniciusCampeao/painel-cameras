@@ -7,6 +7,8 @@ import time
 import threading
 import socket
 import os
+import re
+import shutil
 from urllib.parse import quote
 import cv2
 import numpy as np
@@ -318,6 +320,94 @@ class StreamManager:
 
 streams = StreamManager()
 
+
+# ------------------------------------------------- AO VIVO EM HLS (H.264)
+# Reencoda o stream principal (1080p HEVC) para H.264 em HLS, universal em
+# qualquer navegador. Sobe sob demanda e para quando ninguém está assistindo.
+
+LIVE_RES = os.environ.get("LIVE_RES", "1280:-2")   # 720p (use 1920:-2 p/ 1080p)
+LIVE_CRF = os.environ.get("LIVE_CRF", "23")
+LIVE_PRESET = os.environ.get("LIVE_PRESET", "veryfast")
+LIVE_DIR = os.path.join(os.environ.get("GRAVACAO_DIR",
+                        os.path.join(os.path.expanduser("~"), "gravacoes")), "live")
+RE_LIVE_SEG = re.compile(r"^seg_\d{5}\.ts$")
+
+
+class LiveHLS:
+    """Um ffmpeg por câmera (sob demanda) reencodando RTSP->H.264->HLS."""
+
+    def __init__(self):
+        self.locks = {c: threading.Lock() for c in CAMERAS}
+        self.proc = {c: None for c in CAMERAS}
+        self.last_poll = {c: 0.0 for c in CAMERAS}
+        self.dir = {c: os.path.join(LIVE_DIR, c) for c in CAMERAS}
+        threading.Thread(target=self._watchdog, daemon=True).start()
+
+    def _cmd(self, cam_id, saida):
+        cam = CAMERAS[cam_id]
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-fflags", "nobuffer"]
+        t = cam.get("transporte", "tcp")
+        if t in ("tcp", "udp"):
+            cmd += ["-rtsp_transport", t]
+        cmd += ["-i", rtsp_url(cam), "-an",
+                "-vf", f"scale={LIVE_RES}",
+                "-c:v", "libx264", "-preset", LIVE_PRESET, "-crf", LIVE_CRF,
+                # keyframe a cada 2 s (independe do fps da fonte) -> segmentos de 2 s
+                "-force_key_frames", "expr:gte(t,n_forced*2)",
+                "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+                "-f", "hls", "-hls_time", "2", "-hls_list_size", "6",
+                "-hls_flags", "delete_segments+append_list+omit_endlist",
+                "-hls_segment_type", "mpegts",
+                "-hls_segment_filename", os.path.join(saida, "seg_%05d.ts"),
+                os.path.join(saida, "stream.m3u8")]
+        return cmd
+
+    def touch(self, cam_id):
+        """Marca interesse e garante o ffmpeg rodando."""
+        self.last_poll[cam_id] = time.time()
+        with self.locks[cam_id]:
+            p = self.proc[cam_id]
+            if p is None or p.poll() is not None:
+                self._start(cam_id)
+
+    def _start(self, cam_id):
+        d = self.dir[cam_id]
+        shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+        self.proc[cam_id] = subprocess.Popen(
+            self._cmd(cam_id, d), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[live] {cam_id}: HLS iniciado ({LIVE_RES})", flush=True)
+
+    def _stop(self, cam_id):
+        p = self.proc[cam_id]
+        if p and p.poll() is None:
+            try:
+                p.kill()
+                p.wait(timeout=5)
+            except Exception:
+                pass
+        self.proc[cam_id] = None
+        print(f"[live] {cam_id}: HLS parado", flush=True)
+
+    def _watchdog(self):
+        while True:
+            time.sleep(5)
+            for c in CAMERAS:
+                p = self.proc[c]
+                if (p and p.poll() is None and self.last_poll[c]
+                        and time.time() - self.last_poll[c] > 15):
+                    with self.locks[c]:
+                        self._stop(c)
+
+    def playlist(self, cam_id):
+        return os.path.join(self.dir[cam_id], "stream.m3u8")
+
+    def segmento(self, cam_id, nome):
+        return os.path.join(self.dir[cam_id], nome)
+
+
+live = LiveHLS()
+
 detector_instance = None
 detector_lock = threading.Lock()
 
@@ -385,6 +475,7 @@ HTML = """
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Cameras">
 <link rel="apple-touch-icon" href="/icon-192.svg">
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js"></script>
 <style>
 :root {
   --bg: #0b0d10;
@@ -439,7 +530,7 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
 .dot.off { background:var(--off); box-shadow:0 0 8px var(--off); }
 
 .feed { position:relative; background:#000; line-height:0; }
-.feed img { width:100%; display:block; min-height:190px; object-fit:contain; background:#000; }
+.feed img, .feed video { width:100%; display:block; min-height:190px; object-fit:contain; background:#000; }
 .expand {
   position:absolute; bottom:10px; right:10px;
   width:34px; height:34px; border-radius:10px; border:none;
@@ -548,7 +639,8 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
     </div>
 
     <div class="feed">
-      <img src="/frame/{{ cid }}" alt="{{ cam.nome }}" data-cam-feed="{{ cid }}" data-normal-url="/frame/{{ cid }}" data-detect-url="/frame/{{ cid }}/detect">
+      <video data-cam-video="{{ cid }}" muted autoplay playsinline></video>
+      <img alt="{{ cam.nome }}" data-cam-feed="{{ cid }}" data-detect-url="/frame/{{ cid }}/detect" style="display:none">
       {% if cam.audio %}
       <button class="som" id="som-{{ cid }}" onclick="toggleSom('{{ cid }}')">&#128263;</button>
       {% endif %}
@@ -664,73 +756,103 @@ function toggleSom(cid) {
 }
 
 const detectStatus = {};
+const hlsInst = {};
+const detectTimers = {};
+
+function videoEl(cid) { return document.querySelector('[data-cam-video="' + cid + '"]'); }
+function imgEl(cid) { return document.querySelector('[data-cam-feed="' + cid + '"]'); }
+
+// --- modo normal: HLS em H.264 do stream principal (nitidez, suave, pouca banda)
+function startHls(cid) {
+  const v = videoEl(cid);
+  if (!v) return;
+  const src = '/live/' + cid + '/stream.m3u8';
+  if (window.Hls && Hls.isSupported()) {
+    if (hlsInst[cid]) { try { hlsInst[cid].destroy(); } catch (e) {} }
+    const h = new Hls({ liveSyncDurationCount: 3, maxBufferLength: 12, lowLatencyMode: false });
+    h.loadSource(src);
+    h.attachMedia(v);
+    h.on(Hls.Events.ERROR, (_, d) => {
+      if (d.fatal) {
+        marcar(cid, false);
+        try { h.destroy(); } catch (e) {}
+        hlsInst[cid] = null;
+        setTimeout(() => { if (!detectStatus[cid]) startHls(cid); }, 2500);
+      }
+    });
+    hlsInst[cid] = h;
+  } else {
+    v.src = src;  // Safari/iOS tocam HLS nativo
+  }
+  v.play().catch(() => {});
+  v.onplaying = () => marcar(cid, true);
+  v.onerror = () => marcar(cid, false);
+}
+
+function stopHls(cid) {
+  const v = videoEl(cid);
+  if (hlsInst[cid]) { try { hlsInst[cid].destroy(); } catch (e) {} hlsInst[cid] = null; }
+  if (v) { try { v.pause(); } catch (e) {} v.removeAttribute('src'); try { v.load(); } catch (e) {} }
+}
+
+// --- modo detecção: polling do frame anotado com YOLO (como antes)
+function pollDetect(cid) {
+  const img = imgEl(cid);
+  if (!img || !detectStatus[cid]) return;
+  if (window.congelado) { detectTimers[cid] = setTimeout(() => pollDetect(cid), 400); return; }
+  const next = new Image();
+  next.onload = () => {
+    img.src = next.src; marcar(cid, true);
+    if (detectStatus[cid]) detectTimers[cid] = setTimeout(() => pollDetect(cid), 150);
+  };
+  next.onerror = () => {
+    marcar(cid, false);
+    if (detectStatus[cid]) detectTimers[cid] = setTimeout(() => pollDetect(cid), 2000);
+  };
+  next.src = img.dataset.detectUrl + '?t=' + Date.now();
+}
 
 function toggleDetect(cid) {
   const btn = document.getElementById('detect-' + cid);
-  const img = document.querySelector('[data-cam-feed="' + cid + '"]');
-  if (!img) return;
-
+  const v = videoEl(cid), img = imgEl(cid);
   if (detectStatus[cid]) {
-    img.dataset.useDetect = 'false';
-    detectStatus[cid] = false;
-    btn.classList.remove('on');
+    detectStatus[cid] = false; btn.classList.remove('on');
+    clearTimeout(detectTimers[cid]);
+    if (img) img.style.display = 'none';
+    if (v) v.style.display = 'block';
+    startHls(cid);
     aviso('Detecção desativada');
   } else {
-    img.dataset.useDetect = 'true';
-    detectStatus[cid] = true;
-    btn.classList.add('on');
+    detectStatus[cid] = true; btn.classList.add('on');
+    stopHls(cid);
+    if (v) v.style.display = 'none';
+    if (img) { img.style.display = 'block'; img.src = ''; }
+    pollDetect(cid);
     aviso('Detecção ativada (YOLO + Face)');
   }
 }
 
-function abrirFs(cid, temPtz) {
-  camAtual = cid;
-  document.getElementById('fs').classList.add('on');
-  document.getElementById('fsClose').style.display = 'block';
-  document.getElementById('fsPtz').style.display = temPtz ? 'flex' : 'none';
+function abrirFs(cid) {
+  const el = detectStatus[cid] ? imgEl(cid) : videoEl(cid);
+  if (!el) return;
+  if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+  else if (el.webkitEnterFullscreen) el.webkitEnterFullscreen();  // iOS <video>
+  else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
 }
 
 function fecharFs() {
-  document.getElementById('fsImg').src = '';
-  document.getElementById('fs').classList.remove('on');
-  document.getElementById('fsClose').style.display = 'none';
-  document.getElementById('fsPtz').style.display = 'none';
-  camAtual = null;
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 }
-
-document.querySelectorAll('#fsPtz [data-d]').forEach(b => {
-  b.onclick = () => { if (camAtual) ptz(camAtual, b.dataset.d); };
-});
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') fecharFs(); });
 
-document.querySelectorAll('[data-cam-feed]').forEach(img => {
-  const cid = img.dataset.camFeed;
-  let active = true;
-  img.dataset.useDetect = 'false';
-  function poll() {
-    if (window.congelado) { setTimeout(poll, 400); return; }
-    if (!active) return;
-    const next = new Image();
-    next.onload = () => {
-      img.src = next.src;
-      const fsImg = document.getElementById('fsImg');
-      if (camAtual === cid) fsImg.src = next.src;
-      marcar(cid, true);
-      setTimeout(poll, 150);
-    };
-    next.onerror = () => {
-      marcar(cid, false);
-      setTimeout(poll, 2000);
-    };
-    const useDetect = detectStatus[cid] ? 'detect' : '';
-    const baseUrl = useDetect ? img.dataset.detectUrl : img.dataset.normalUrl;
-    next.src = baseUrl + '?t=' + Date.now();
-  }
-  poll();
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) { active = false; }
-    else { active = true; poll(); }
+// inicia o HLS de todas as câmeras (modo normal)
+document.querySelectorAll('[data-cam-video]').forEach(v => startHls(v.dataset.camVideo));
+document.addEventListener('visibilitychange', () => {
+  document.querySelectorAll('[data-cam-video]').forEach(v => {
+    const cid = v.dataset.camVideo;
+    if (document.hidden) { if (!detectStatus[cid]) stopHls(cid); }
+    else { if (detectStatus[cid]) pollDetect(cid); else startHls(cid); }
   });
 });
 
@@ -812,17 +934,22 @@ function abrirTravado() {
   window.congelado = true;
   const grade = document.getElementById('tr-grade');
   grade.innerHTML = '';
-  document.querySelectorAll('[data-cam-feed]').forEach(img => {
-    const cid = img.dataset.camFeed;
+  document.querySelectorAll('[data-cam-video]').forEach(v => {
+    const cid = v.dataset.camVideo;
+    const img = imgEl(cid);
+    // em modo detecção a imagem está no <img>; no normal, no <video>
+    const fonte = (detectStatus[cid] && img && img.naturalWidth > 0) ? img : v;
     const cel = document.createElement('div');
     cel.className = 'tr-cel';
     const nome = document.createElement('span');
     nome.className = 'nome';
     nome.textContent = CAMERAS_NOMES[cid] || cid;
     const cv = document.createElement('canvas');
-    if (img.complete && img.naturalWidth > 0) {
-      cv.width = img.naturalWidth; cv.height = img.naturalHeight;
-      cv.getContext('2d').drawImage(img, 0, 0);
+    const w = fonte.videoWidth || fonte.naturalWidth || 0;
+    const hh = fonte.videoHeight || fonte.naturalHeight || 0;
+    if (w > 0 && hh > 0) {
+      cv.width = w; cv.height = hh;
+      try { cv.getContext('2d').drawImage(fonte, 0, 0, w, hh); } catch (e) {}
     }
     cel.appendChild(cv); cel.appendChild(nome);
     grade.appendChild(cel);
@@ -991,6 +1118,40 @@ def frame_detect(cam_id):
     except Exception as e:
         print(f"[frame_detect] erro: {e}")
         return "", 500
+
+
+@app.route("/live/<cam_id>/stream.m3u8")
+@auth.login_required
+def live_playlist(cam_id):
+    if cam_id not in CAMERAS:
+        return "Camera nao encontrada", 404
+    if gravacao.privacidade_ativa():
+        return "Privacidade ativa", 403
+    live.touch(cam_id)
+    path = live.playlist(cam_id)
+    for _ in range(60):  # espera o ffmpeg gerar o primeiro m3u8 (~1-3 s)
+        if os.path.isfile(path):
+            break
+        time.sleep(0.1)
+    if not os.path.isfile(path):
+        return "Stream iniciando", 503
+    resp = send_file(path, mimetype="application/vnd.apple.mpegurl")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/live/<cam_id>/<nome>")
+@auth.login_required
+def live_segmento(cam_id, nome):
+    if cam_id not in CAMERAS or not RE_LIVE_SEG.match(nome):
+        return "Nao encontrado", 404
+    live.touch(cam_id)
+    path = live.segmento(cam_id, nome)
+    if not os.path.isfile(path):
+        return "", 404
+    resp = send_file(path, mimetype="video/mp2t")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/audio/<cam_id>")
@@ -1218,6 +1379,8 @@ def privacidade():
             with streams.locks[c]:
                 streams.running[c] = False
                 streams.viewers[c] = 0
+            with live.locks[c]:
+                live._stop(c)
     return jsonify({"ok": True, **estado})
 
 
