@@ -644,7 +644,7 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
 </head>
 <body>
 
-<div class="login-modal show" id="loginModal">
+<div class="login-modal" id="loginModal">
   <div class="login-card">
     <h2>Acesso Restrito</h2>
     <form class="login-form" id="loginForm" onsubmit="handleLogin(event)">
@@ -1094,7 +1094,7 @@ async function handleLogin(event) {
 
 (async function checkAuth() {
   try {
-    const res = await fetch('/check-auth');
+    const res = await fetch('/check-auth', {credentials: 'include'});
     if (!res.ok) {
       document.getElementById('loginModal').classList.add('show');
       document.getElementById('username').focus();
