@@ -1,6 +1,6 @@
-from flask import Flask, Response, render_template_string, jsonify, request, send_file
-from flask_httpauth import HTTPBasicAuth
+from flask import Flask, Response, render_template_string, jsonify, request, send_file, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 from dotenv import load_dotenv
 import subprocess
 import time
@@ -36,16 +36,19 @@ from paginas_gravacao import REGISTROS_HTML, GRAVACOES_HTML
 from paginas_rostos import ROSTOS_HTML
 
 app = Flask(__name__)
-auth = HTTPBasicAuth()
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-insecure-key-change-in-prod")
 
 USERS = {
     os.environ["PAINEL_USER"]: generate_password_hash(os.environ["PAINEL_SENHA"])
 }
 
-@auth.verify_password
-def verify(username, password):
-    if username in USERS and check_password_hash(USERS[username], password):
-        return username
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if "username" not in session:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated_function
 
 
 CAMERAS = {
@@ -614,9 +617,44 @@ header .sub { font-size:12px; color:var(--dim); margin-top:2px; }
   background:rgba(10,12,15,0.7); backdrop-filter:blur(12px);
   padding:12px 18px; border-radius:18px; border:1px solid rgba(255,255,255,0.08);
 }
+.login-modal {
+  position:fixed; inset:0; z-index:400; background:rgba(0,0,0,0.6); display:none;
+  flex-direction:column; align-items:center; justify-content:center;
+  padding:20px;
+}
+.login-modal.show { display:flex; }
+.login-card {
+  background:var(--card); border:1px solid var(--line); border-radius:16px;
+  padding:32px 24px; width:100%; max-width:340px;
+}
+.login-card h2 { font-size:18px; font-weight:650; margin-bottom:24px; text-align:center; }
+.login-form { display:flex; flex-direction:column; gap:12px; }
+.login-form input {
+  background:var(--card-2); border:1px solid var(--line); border-radius:10px;
+  padding:12px 14px; color:var(--txt); font-family:inherit; font-size:15px;
+}
+.login-form input::placeholder { color:var(--dim); }
+.login-form button {
+  background:var(--ok); color:#000; border:none; border-radius:10px; padding:12px;
+  font-weight:600; font-size:15px; cursor:pointer; margin-top:8px;
+}
+.login-form button:active { transform:scale(0.98); }
+.login-error { color:#f2545b; font-size:13px; text-align:center; }
 </style>
 </head>
 <body>
+
+<div class="login-modal show" id="loginModal">
+  <div class="login-card">
+    <h2>Acesso Restrito</h2>
+    <form class="login-form" id="loginForm" onsubmit="handleLogin(event)">
+      <input type="text" id="username" placeholder="Usuário" autocomplete="off">
+      <input type="password" id="password" placeholder="Senha" autocomplete="off">
+      <button type="submit">Entrar</button>
+      <div class="login-error" id="loginError"></div>
+    </form>
+  </div>
+</div>
 
 <header>
   <div>
@@ -999,6 +1037,48 @@ async function alternarPrivacidade() {
 })();
 document.addEventListener('keydown', e => { if (e.key === 'Escape') fecharTravado(); });
 
+async function handleLogin(event) {
+  event.preventDefault();
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value.trim();
+  const errorEl = document.getElementById('loginError');
+
+  if (!username || !password) {
+    errorEl.textContent = 'Preencha usuário e senha';
+    return;
+  }
+
+  try {
+    const res = await fetch('/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password})
+    });
+
+    if (res.ok) {
+      document.getElementById('loginModal').classList.remove('show');
+      location.reload();
+    } else {
+      errorEl.textContent = 'Usuário ou senha incorretos';
+      document.getElementById('password').value = '';
+    }
+  } catch (e) {
+    errorEl.textContent = 'Erro ao conectar';
+  }
+}
+
+(async function checkAuth() {
+  try {
+    const res = await fetch('/check-auth');
+    if (!res.ok) {
+      document.getElementById('loginModal').classList.add('show');
+      document.getElementById('username').focus();
+    }
+  } catch (e) {
+    console.error('Erro ao verificar autenticação:', e);
+  }
+})();
+
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 </script>
 </body>
@@ -1024,8 +1104,34 @@ ICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">'
             '<rect x="58" y="134" width="76" height="8" rx="4" fill="#2b3440"/></svg>')
 
 
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json()
+    username = data.get("username", "")
+    password = data.get("password", "")
+
+    if username in USERS and check_password_hash(USERS[username], password):
+        session["username"] = username
+        return jsonify({"ok": True})
+
+    return jsonify({"error": "Credenciais inválidas"}), 401
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/check-auth")
+def check_auth():
+    if "username" in session:
+        return jsonify({"authenticated": True})
+    return jsonify({"authenticated": False}), 401
+
+
 @app.route("/")
-@auth.login_required
+@login_required
 def index():
     return render_template_string(HTML, cameras=CAMERAS, nomes=_opcoes_cameras())
 
@@ -1047,7 +1153,7 @@ def icone():
 
 
 @app.route("/video/<cam_id>")
-@auth.login_required
+@login_required
 def video(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
@@ -1073,7 +1179,7 @@ def _placeholder_jpeg():
 
 
 @app.route("/frame/<cam_id>")
-@auth.login_required
+@login_required
 def frame(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
@@ -1089,7 +1195,7 @@ def frame(cam_id):
 
 
 @app.route("/frame/<cam_id>/detect")
-@auth.login_required
+@login_required
 def frame_detect(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
@@ -1124,7 +1230,7 @@ def frame_detect(cam_id):
 
 
 @app.route("/live/<cam_id>/stream.m3u8")
-@auth.login_required
+@login_required
 def live_playlist(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
@@ -1144,7 +1250,7 @@ def live_playlist(cam_id):
 
 
 @app.route("/live/<cam_id>/<nome>")
-@auth.login_required
+@login_required
 def live_segmento(cam_id, nome):
     if cam_id not in CAMERAS or not RE_LIVE_SEG.match(nome):
         return "Nao encontrado", 404
@@ -1158,7 +1264,7 @@ def live_segmento(cam_id, nome):
 
 
 @app.route("/audio/<cam_id>")
-@auth.login_required
+@login_required
 def audio(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
@@ -1170,7 +1276,7 @@ def audio(cam_id):
 
 
 @app.route("/ptz/<cam_id>", methods=["POST"])
-@auth.login_required
+@login_required
 def ptz_route(cam_id):
     if cam_id not in CAMERAS:
         return jsonify({"ok": False, "erro": "camera invalida"}), 404
@@ -1182,7 +1288,7 @@ def ptz_route(cam_id):
 
 
 @app.route("/ptz-debug/<cam_id>")
-@auth.login_required
+@login_required
 def ptz_debug(cam_id):
     if cam_id not in CAMERAS:
         return jsonify({"erro": "camera invalida"}), 404
@@ -1194,7 +1300,7 @@ def ptz_debug(cam_id):
 
 
 @app.route("/snapshot/<cam_id>")
-@auth.login_required
+@login_required
 def snapshot(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
@@ -1243,13 +1349,13 @@ def _opcoes_cameras():
 
 
 @app.route("/registros")
-@auth.login_required
+@login_required
 def registros_page():
     return render_template_string(REGISTROS_HTML, opcoes=_opcoes_cameras())
 
 
 @app.route("/gravacoes")
-@auth.login_required
+@login_required
 def gravacoes_page():
     cam = request.args.get("cam", "")
     if cam not in CAMERAS:
@@ -1263,7 +1369,7 @@ def gravacoes_page():
 
 
 @app.route("/api/registros")
-@auth.login_required
+@login_required
 def api_registros():
     cam = request.args.get("cam") or None
     if cam and cam not in CAMERAS:
@@ -1276,7 +1382,7 @@ def api_registros():
 
 
 @app.route("/registro/<int:eid>/imagem")
-@auth.login_required
+@login_required
 def registro_imagem(eid):
     caminho = registro.miniatura_caminho(eid)
     if not caminho:
@@ -1285,13 +1391,13 @@ def registro_imagem(eid):
 
 
 @app.route("/rostos")
-@auth.login_required
+@login_required
 def rostos_page():
     return render_template_string(ROSTOS_HTML)
 
 
 @app.route("/api/rostos")
-@auth.login_required
+@login_required
 def api_rostos():
     status = request.args.get("status") or None
     if status not in (None, "pendente", "rotulado"):
@@ -1300,7 +1406,7 @@ def api_rostos():
 
 
 @app.route("/rosto/<int:rid>/imagem")
-@auth.login_required
+@login_required
 def rosto_imagem(rid):
     caminho = rostos.thumb_caminho(rid)
     if not caminho:
@@ -1309,7 +1415,7 @@ def rosto_imagem(rid):
 
 
 @app.route("/api/rosto/<int:rid>/rotular", methods=["POST"])
-@auth.login_required
+@login_required
 def api_rosto_rotular(rid):
     dados = request.get_json(silent=True) or {}
     rotulo = dados.get("rotulo")
@@ -1321,7 +1427,7 @@ def api_rosto_rotular(rid):
 
 
 @app.route("/api/grupo/<int:grupo>/rotular", methods=["POST"])
-@auth.login_required
+@login_required
 def api_grupo_rotular(grupo):
     dados = request.get_json(silent=True) or {}
     rotulo = dados.get("rotulo")
@@ -1334,7 +1440,7 @@ def api_grupo_rotular(grupo):
 
 
 @app.route("/gravacao/<cam_id>/playlist.m3u8")
-@auth.login_required
+@login_required
 def gravacao_playlist(cam_id):
     if cam_id not in CAMERAS:
         return "Camera nao encontrada", 404
@@ -1346,7 +1452,7 @@ def gravacao_playlist(cam_id):
 
 
 @app.route("/gravacao/<cam_id>/segmentos")
-@auth.login_required
+@login_required
 def gravacao_segmentos(cam_id):
     if cam_id not in CAMERAS:
         return jsonify({"erro": "camera invalida"}), 404
@@ -1356,7 +1462,7 @@ def gravacao_segmentos(cam_id):
 
 
 @app.route("/gravacao/<cam_id>/<run>/<nome>")
-@auth.login_required
+@login_required
 def gravacao_segmento(cam_id, run, nome):
     if (cam_id not in CAMERAS or not gravacao.RE_RUN.match(run)
             or not gravacao.RE_SEG.match(nome)):
@@ -1368,7 +1474,7 @@ def gravacao_segmento(cam_id, run, nome):
 
 
 @app.route("/privacidade", methods=["GET", "POST"])
-@auth.login_required
+@login_required
 def privacidade():
     if request.method == "GET":
         return jsonify(gravacao.privacidade_estado())
@@ -1388,7 +1494,7 @@ def privacidade():
 
 
 @app.route("/restart", methods=["POST"])
-@auth.login_required
+@login_required
 def restart():
     try:
         subprocess.Popen(
@@ -1402,7 +1508,7 @@ def restart():
 
 
 @app.route("/status")
-@auth.login_required
+@login_required
 def status():
     return jsonify({c: {"viewers": streams.viewers[c], "running": streams.running[c]}
                     for c in CAMERAS})
