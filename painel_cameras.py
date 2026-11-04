@@ -1044,6 +1044,8 @@ async function handleLogin(event) {
   const errorEl = document.getElementById('loginError');
   const btn = event.target.querySelector('button');
 
+  console.log('[login] Tentando login com:', username);
+
   if (!username || !password) {
     errorEl.textContent = 'Preencha usuário e senha';
     return;
@@ -1054,27 +1056,36 @@ async function handleLogin(event) {
   errorEl.textContent = '';
 
   try {
+    console.log('[login] Enviando POST para /login');
     const res = await fetch('/login', {
       method: 'POST',
+      credentials: 'include',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({username, password})
     });
 
+    console.log('[login] Resposta recebida:', res.status);
+
     if (res.ok) {
+      const data = await res.json();
+      console.log('[login] Sucesso:', data);
       errorEl.textContent = '✓ Login realizado!';
       document.getElementById('username').value = '';
       document.getElementById('password').value = '';
       setTimeout(() => {
+        console.log('[login] Removendo modal e recarregando');
         document.getElementById('loginModal').classList.remove('show');
         location.reload();
       }, 500);
     } else {
+      console.log('[login] Falha na autenticação');
       errorEl.textContent = '✗ Usuário ou senha incorretos';
       document.getElementById('password').value = '';
       btn.disabled = false;
       btn.textContent = 'Entrar';
     }
   } catch (e) {
+    console.error('[login] Erro:', e);
     errorEl.textContent = '✗ Erro ao conectar ao servidor';
     btn.disabled = false;
     btn.textContent = 'Entrar';
