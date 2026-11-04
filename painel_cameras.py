@@ -1131,7 +1131,6 @@ def check_auth():
 
 
 @app.route("/")
-@login_required
 def index():
     return render_template_string(HTML, cameras=CAMERAS, nomes=_opcoes_cameras())
 
