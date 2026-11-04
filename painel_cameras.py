@@ -1042,11 +1042,16 @@ async function handleLogin(event) {
   const username = document.getElementById('username').value.trim();
   const password = document.getElementById('password').value.trim();
   const errorEl = document.getElementById('loginError');
+  const btn = event.target.querySelector('button');
 
   if (!username || !password) {
     errorEl.textContent = 'Preencha usuário e senha';
     return;
   }
+
+  btn.disabled = true;
+  btn.textContent = 'Entrando...';
+  errorEl.textContent = '';
 
   try {
     const res = await fetch('/login', {
@@ -1056,14 +1061,23 @@ async function handleLogin(event) {
     });
 
     if (res.ok) {
-      document.getElementById('loginModal').classList.remove('show');
-      location.reload();
-    } else {
-      errorEl.textContent = 'Usuário ou senha incorretos';
+      errorEl.textContent = '✓ Login realizado!';
+      document.getElementById('username').value = '';
       document.getElementById('password').value = '';
+      setTimeout(() => {
+        document.getElementById('loginModal').classList.remove('show');
+        location.reload();
+      }, 500);
+    } else {
+      errorEl.textContent = '✗ Usuário ou senha incorretos';
+      document.getElementById('password').value = '';
+      btn.disabled = false;
+      btn.textContent = 'Entrar';
     }
   } catch (e) {
-    errorEl.textContent = 'Erro ao conectar';
+    errorEl.textContent = '✗ Erro ao conectar ao servidor';
+    btn.disabled = false;
+    btn.textContent = 'Entrar';
   }
 }
 
